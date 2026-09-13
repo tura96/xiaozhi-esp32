@@ -8,6 +8,9 @@ on:
       - esp32c3-supermini
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     name: Build esp32c3-supermini
@@ -22,11 +25,21 @@ jobs:
         shell: bash
         run: |
           source $IDF_PATH/export.sh
-          python scripts/build.py esp32c3-supermini --name esp32c3-supermini
+          python scripts/build.py esp32c3-supermini --name esp32c3-supermini --language vi-VN
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: xiaozhi_esp32c3_supermini
+          name: xiaozhi_esp32c3_supermini_vi
           path: build/merged-binary.bin
           if-no-files-found: error
+
+      - name: Release binary
+        uses: softprops/action-gh-release@v2
+        continue-on-error: true
+        with:
+          tag_name: v-esp32c3-vi
+          name: "XiaoZhi ESP32-C3 SuperMini (Vietnamese)"
+          files: build/merged-binary.bin
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
