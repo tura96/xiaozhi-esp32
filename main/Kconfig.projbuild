@@ -605,6 +605,9 @@ choice BOARD_TYPE
     config BOARD_TYPE_XMINI_C3_V3
         bool "Xmini C3 V3"
         depends on IDF_TARGET_ESP32C3
+    config BOARD_TYPE_ESP32C3_SUPERMINI
+        bool "ESP32-C3 Super Mini (SSD1306 + MAX98357A + INMP441)"
+        depends on IDF_TARGET_ESP32C3
     config BOARD_TYPE_XORIGIN_AIPI_LITE
         bool "XOrigin AiPi-Lite"
         depends on IDF_TARGET_ESP32S3
