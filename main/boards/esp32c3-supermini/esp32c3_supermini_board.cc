@@ -15,6 +15,7 @@
 #include <esp_lcd_panel_vendor.h>
 #include <lwip/sockets.h>
 #include <lwip/netdb.h>
+#include <esp_netif.h>
 #include <cJSON.h>
 #include <string>
 
@@ -203,6 +204,18 @@ private:
         char rx_buffer[256];
 
         while (1) {
+            // Ensure TCPIP stack and Wi-Fi interface are initialized and have an IP
+            esp_netif_t* netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+            esp_netif_ip_info_t ip_info;
+            if (!netif || esp_netif_get_ip_info(netif, &ip_info) != ESP_OK || ip_info.ip.addr == 0) {
+                if (sock >= 0) {
+                    close(sock);
+                    sock = -1;
+                }
+                vTaskDelay(pdMS_TO_TICKS(1000));
+                continue;
+            }
+
             if (sock < 0) {
                 sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
                 if (sock < 0) {
