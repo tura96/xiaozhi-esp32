@@ -232,6 +232,9 @@ private:
                 setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
                 setsockopt(sock, SOL_SOCKET, SO_BROADCAST, &opt, sizeof(opt));
 
+                struct timeval tv = { .tv_sec = 2, .tv_usec = 0 };
+                setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
                 if (bind(sock, (struct sockaddr*)&saddr, sizeof(saddr)) < 0) {
                     ESP_LOGE(TAG, "Failed to bind UDP socket to port 58922");
                     close(sock);
@@ -266,7 +269,7 @@ private:
                     cJSON_Delete(root);
                 }
             } else {
-                vTaskDelay(pdMS_TO_TICKS(100));
+                vTaskDelay(pdMS_TO_TICKS(50));
             }
         }
     }
@@ -280,7 +283,7 @@ public:
         InitializeSsd1306Display();
         InitializeButtons();
         InitializeTools();
-        xTaskCreate(QuotaListenerTask, "quota_listener", 3072, this, 2, nullptr);
+        xTaskCreate(QuotaListenerTask, "quota_listener", 3072, this, 1, nullptr);
     }
 
     virtual AudioCodec* GetAudioCodec() override {

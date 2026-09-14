@@ -3,6 +3,7 @@
 
 #include "display/oled_display.h"
 #include "assets/lang_config.h"
+#include "application.h"
 #include <esp_log.h>
 #include <cstring>
 #include <cstdio>
@@ -23,7 +24,7 @@ private:
     lv_obj_t* bar_7d_ = nullptr;
     lv_obj_t* eta_7d_ = nullptr;
 
-    bool quota_visible_ = true;
+    bool quota_visible_ = false;
 
 public:
     SuperminiOledDisplay(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_handle_t panel,
@@ -154,12 +155,22 @@ public:
         lv_label_set_long_mode(eta_7d_, LV_LABEL_LONG_CLIP);
         lv_label_set_text(eta_7d_, "--");
 
-        quota_visible_ = true;
+        lv_obj_add_flag(quota_container_, LV_OBJ_FLAG_HIDDEN);
+        quota_visible_ = false;
     }
 
     void SetQuotaVisible(bool visible) {
         DisplayLockGuard lock(this);
         if (!quota_container_) return;
+
+        // Quota screen is only allowed during Idle (Standby) state
+        if (visible) {
+            auto state = Application::GetInstance().GetDeviceState();
+            if (state != kDeviceStateIdle) {
+                visible = false;
+            }
+        }
+
         if (visible == quota_visible_) return;
         quota_visible_ = visible;
         if (visible) {
@@ -201,21 +212,15 @@ public:
         OledDisplay::SetChatMessage(role, content);
         if (content != nullptr && content[0] != '\0') {
             SetQuotaVisible(false);
-        } else {
-            SetQuotaVisible(true);
         }
     }
 
     virtual void ClearChatMessages() override {
         OledDisplay::ClearChatMessages();
-        SetQuotaVisible(true);
     }
 
     virtual void SetEmotion(const char* emotion) override {
         OledDisplay::SetEmotion(emotion);
-        if (emotion != nullptr && strcmp(emotion, "neutral") != 0 && strcmp(emotion, "standby") != 0) {
-            SetQuotaVisible(false);
-        }
     }
 
     virtual void SetStatus(const char* status) override {
@@ -223,9 +228,7 @@ public:
         if (status != nullptr) {
             if (strcmp(status, Lang::Strings::STANDBY) == 0) {
                 SetQuotaVisible(true);
-            } else if (strcmp(status, Lang::Strings::LISTENING) == 0 ||
-                       strcmp(status, Lang::Strings::SPEAKING) == 0 ||
-                       strcmp(status, Lang::Strings::CONNECTING) == 0) {
+            } else {
                 SetQuotaVisible(false);
             }
         }
