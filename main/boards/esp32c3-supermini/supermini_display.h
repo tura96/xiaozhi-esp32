@@ -24,7 +24,7 @@ private:
     lv_obj_t* bar_7d_ = nullptr;
     lv_obj_t* eta_7d_ = nullptr;
 
-    bool quota_visible_ = false;
+    bool quota_visible_ = true;
 
 public:
     SuperminiOledDisplay(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_handle_t panel,
@@ -153,10 +153,12 @@ public:
         lv_obj_set_style_text_align(eta_7d_, LV_TEXT_ALIGN_CENTER, 0);
         lv_obj_remove_flag(eta_7d_, LV_OBJ_FLAG_SCROLLABLE);
         lv_label_set_long_mode(eta_7d_, LV_LABEL_LONG_CLIP);
-        lv_label_set_text(eta_7d_, "--");
+        quota_visible_ = true;
+    }
 
-        lv_obj_add_flag(quota_container_, LV_OBJ_FLAG_HIDDEN);
-        quota_visible_ = false;
+    void UpdateQuotaVisibility() {
+        bool should_show = (Application::GetInstance().GetDeviceState() == kDeviceStateIdle);
+        SetQuotaVisible(should_show);
     }
 
     void SetQuotaVisible(bool visible) {
@@ -174,6 +176,7 @@ public:
         if (visible == quota_visible_) return;
         quota_visible_ = visible;
         if (visible) {
+            lv_obj_move_foreground(quota_container_);
             lv_obj_remove_flag(quota_container_, LV_OBJ_FLAG_HIDDEN);
         } else {
             lv_obj_add_flag(quota_container_, LV_OBJ_FLAG_HIDDEN);
@@ -206,32 +209,32 @@ public:
             lv_label_set_text(eta_7d_, "--");
         }
         lv_bar_set_value(bar_7d_, (int32_t)week_percent, LV_ANIM_OFF);
+
+        UpdateQuotaVisibility();
     }
 
     virtual void SetChatMessage(const char* role, const char* content) override {
         OledDisplay::SetChatMessage(role, content);
         if (content != nullptr && content[0] != '\0') {
             SetQuotaVisible(false);
+        } else {
+            UpdateQuotaVisibility();
         }
     }
 
     virtual void ClearChatMessages() override {
         OledDisplay::ClearChatMessages();
+        UpdateQuotaVisibility();
     }
 
     virtual void SetEmotion(const char* emotion) override {
         OledDisplay::SetEmotion(emotion);
+        UpdateQuotaVisibility();
     }
 
     virtual void SetStatus(const char* status) override {
         OledDisplay::SetStatus(status);
-        if (status != nullptr) {
-            if (strcmp(status, Lang::Strings::STANDBY) == 0) {
-                SetQuotaVisible(true);
-            } else {
-                SetQuotaVisible(false);
-            }
-        }
+        UpdateQuotaVisibility();
     }
 };
 
