@@ -16,6 +16,7 @@
 #include <lwip/sockets.h>
 #include <lwip/netdb.h>
 #include <esp_netif.h>
+#include <wifi_manager.h>
 #include <cJSON.h>
 #include <string>
 
@@ -204,10 +205,8 @@ private:
         char rx_buffer[256];
 
         while (1) {
-            // Ensure TCPIP stack and Wi-Fi interface are initialized and have an IP
-            esp_netif_t* netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
-            esp_netif_ip_info_t ip_info;
-            if (!netif || esp_netif_get_ip_info(netif, &ip_info) != ESP_OK || ip_info.ip.addr == 0) {
+            auto& wifi = WifiManager::GetInstance();
+            if (!wifi.IsConnected() || wifi.GetIpAddress().empty()) {
                 if (sock >= 0) {
                     close(sock);
                     sock = -1;
@@ -220,7 +219,7 @@ private:
                 sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
                 if (sock < 0) {
                     ESP_LOGE(TAG, "Unable to create UDP quota socket");
-                    vTaskDelay(pdMS_TO_TICKS(5000));
+                    vTaskDelay(pdMS_TO_TICKS(2000));
                     continue;
                 }
 
@@ -231,15 +230,17 @@ private:
 
                 int opt = 1;
                 setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+                setsockopt(sock, SOL_SOCKET, SO_BROADCAST, &opt, sizeof(opt));
 
                 if (bind(sock, (struct sockaddr*)&saddr, sizeof(saddr)) < 0) {
                     ESP_LOGE(TAG, "Failed to bind UDP socket to port 58922");
                     close(sock);
                     sock = -1;
-                    vTaskDelay(pdMS_TO_TICKS(5000));
+                    vTaskDelay(pdMS_TO_TICKS(2000));
                     continue;
                 }
-                ESP_LOGI(TAG, "UDP Quota listener started on port 58922");
+                ESP_LOGI(TAG, "UDP Quota listener successfully bound to 0.0.0.0:58922 (IP: %s)",
+                         wifi.GetIpAddress().c_str());
             }
 
             struct sockaddr_in source_addr;
@@ -248,6 +249,7 @@ private:
                                (struct sockaddr*)&source_addr, &socklen);
             if (len > 0) {
                 rx_buffer[len] = '\0';
+                ESP_LOGI(TAG, "Received UDP quota packet (%d bytes): %s", len, rx_buffer);
                 cJSON* root = cJSON_Parse(rx_buffer);
                 if (root) {
                     cJSON* ctx_item = cJSON_GetObjectItem(root, "ctx");

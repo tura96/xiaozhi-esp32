@@ -10,12 +10,19 @@
 class SuperminiOledDisplay : public OledDisplay {
 private:
     lv_obj_t* quota_container_ = nullptr;
+    lv_obj_t* divider_ = nullptr;
+
+    // Column 1: 5-Hour Quota
+    lv_obj_t* title_5h_ = nullptr;
     lv_obj_t* label_5h_ = nullptr;
-    lv_obj_t* eta_5h_ = nullptr;
     lv_obj_t* bar_5h_ = nullptr;
+    lv_obj_t* eta_5h_ = nullptr;
+
+    // Column 2: Weekly Quota
+    lv_obj_t* title_7d_ = nullptr;
     lv_obj_t* label_7d_ = nullptr;
-    lv_obj_t* eta_7d_ = nullptr;
     lv_obj_t* bar_7d_ = nullptr;
+    lv_obj_t* eta_7d_ = nullptr;
 
     bool quota_visible_ = true;
 
@@ -25,13 +32,13 @@ public:
         : OledDisplay(panel_io, panel, width, height, mirror_x, mirror_y) {}
 
     virtual void SetupUI() override {
-        // First let base class setup top_bar_, status_bar_, content_, etc.
+        // Let base class setup top_bar_, status_bar_, content_, etc.
         OledDisplay::SetupUI();
 
         DisplayLockGuard lock(this);
         auto screen = lv_screen_active();
 
-        // Create Quota container overlaying the content area (Y = 16 to 64, Height = 48)
+        // Quota container occupying the lower 48 pixels (Y = 16 to 64)
         quota_container_ = lv_obj_create(screen);
         lv_obj_set_pos(quota_container_, 0, 16);
         lv_obj_set_size(quota_container_, LV_HOR_RES, LV_VER_RES - 16);
@@ -43,22 +50,34 @@ public:
         lv_obj_set_scrollbar_mode(quota_container_, LV_SCROLLBAR_MODE_OFF);
         lv_obj_set_style_layout(quota_container_, LV_LAYOUT_NONE, 0);
 
-        // --- Row 1: 5-Hour Text (Y = 1) ---
+        // Center vertical divider line (1px width)
+        divider_ = lv_obj_create(quota_container_);
+        lv_obj_set_pos(divider_, 63, 3);
+        lv_obj_set_size(divider_, 1, 42);
+        lv_obj_set_style_bg_color(divider_, lv_color_black(), 0);
+        lv_obj_set_style_bg_opa(divider_, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_width(divider_, 0, 0);
+        lv_obj_set_style_radius(divider_, 0, 0);
+
+        // ==================== COLUMN 1: 5-HOUR (X: 0 to 62) ====================
+        // Row 1: Header (Y = 1)
+        title_5h_ = lv_label_create(quota_container_);
+        lv_obj_set_pos(title_5h_, 2, 1);
+        lv_obj_set_size(title_5h_, 60, 12);
+        lv_obj_set_style_text_align(title_5h_, LV_TEXT_ALIGN_CENTER, 0);
+        lv_label_set_text(title_5h_, "5-HOUR");
+
+        // Row 2: Large % Text (Y = 13)
         label_5h_ = lv_label_create(quota_container_);
-        lv_obj_set_pos(label_5h_, 2, 1);
-        lv_obj_set_size(label_5h_, 62, 12);
-        lv_label_set_text(label_5h_, "5H: --%");
+        lv_obj_set_pos(label_5h_, 2, 13);
+        lv_obj_set_size(label_5h_, 60, 15);
+        lv_obj_set_style_text_align(label_5h_, LV_TEXT_ALIGN_CENTER, 0);
+        lv_label_set_text(label_5h_, "--%");
 
-        eta_5h_ = lv_label_create(quota_container_);
-        lv_obj_set_pos(eta_5h_, 64, 1);
-        lv_obj_set_size(eta_5h_, 62, 12);
-        lv_obj_set_style_text_align(eta_5h_, LV_TEXT_ALIGN_RIGHT, 0);
-        lv_label_set_text(eta_5h_, "rst:--");
-
-        // --- Row 2: 5-Hour Progress Bar (Y = 14) ---
+        // Row 3: Thin Progress Bar (Y = 29, Height = 3px)
         bar_5h_ = lv_bar_create(quota_container_);
-        lv_obj_set_pos(bar_5h_, 2, 14);
-        lv_obj_set_size(bar_5h_, 124, 5);
+        lv_obj_set_pos(bar_5h_, 4, 29);
+        lv_obj_set_size(bar_5h_, 56, 3);
         lv_bar_set_range(bar_5h_, 0, 100);
         lv_bar_set_value(bar_5h_, 0, LV_ANIM_OFF);
         lv_obj_set_style_radius(bar_5h_, 0, 0);
@@ -70,22 +89,32 @@ public:
         lv_obj_set_style_bg_color(bar_5h_, lv_color_black(), LV_PART_INDICATOR);
         lv_obj_set_style_bg_opa(bar_5h_, LV_OPA_COVER, LV_PART_INDICATOR);
 
-        // --- Row 3: 7-Day Text (Y = 23) ---
+        // Row 4: Reset ETA (Y = 34)
+        eta_5h_ = lv_label_create(quota_container_);
+        lv_obj_set_pos(eta_5h_, 2, 34);
+        lv_obj_set_size(eta_5h_, 60, 12);
+        lv_obj_set_style_text_align(eta_5h_, LV_TEXT_ALIGN_CENTER, 0);
+        lv_label_set_text(eta_5h_, "rst:--");
+
+        // ==================== COLUMN 2: WEEKLY (X: 65 to 127) ====================
+        // Row 1: Header (Y = 1)
+        title_7d_ = lv_label_create(quota_container_);
+        lv_obj_set_pos(title_7d_, 66, 1);
+        lv_obj_set_size(title_7d_, 60, 12);
+        lv_obj_set_style_text_align(title_7d_, LV_TEXT_ALIGN_CENTER, 0);
+        lv_label_set_text(title_7d_, "WEEKLY");
+
+        // Row 2: Large % Text (Y = 13)
         label_7d_ = lv_label_create(quota_container_);
-        lv_obj_set_pos(label_7d_, 2, 23);
-        lv_obj_set_size(label_7d_, 62, 12);
-        lv_label_set_text(label_7d_, "7D: --%");
+        lv_obj_set_pos(label_7d_, 66, 13);
+        lv_obj_set_size(label_7d_, 60, 15);
+        lv_obj_set_style_text_align(label_7d_, LV_TEXT_ALIGN_CENTER, 0);
+        lv_label_set_text(label_7d_, "--%");
 
-        eta_7d_ = lv_label_create(quota_container_);
-        lv_obj_set_pos(eta_7d_, 64, 23);
-        lv_obj_set_size(eta_7d_, 62, 12);
-        lv_obj_set_style_text_align(eta_7d_, LV_TEXT_ALIGN_RIGHT, 0);
-        lv_label_set_text(eta_7d_, "rst:--");
-
-        // --- Row 4: 7-Day Progress Bar (Y = 36) ---
+        // Row 3: Thin Progress Bar (Y = 29, Height = 3px)
         bar_7d_ = lv_bar_create(quota_container_);
-        lv_obj_set_pos(bar_7d_, 2, 36);
-        lv_obj_set_size(bar_7d_, 124, 5);
+        lv_obj_set_pos(bar_7d_, 68, 29);
+        lv_obj_set_size(bar_7d_, 56, 3);
         lv_bar_set_range(bar_7d_, 0, 100);
         lv_bar_set_value(bar_7d_, 0, LV_ANIM_OFF);
         lv_obj_set_style_radius(bar_7d_, 0, 0);
@@ -96,6 +125,13 @@ public:
         lv_obj_set_style_bg_opa(bar_7d_, LV_OPA_COVER, 0);
         lv_obj_set_style_bg_color(bar_7d_, lv_color_black(), LV_PART_INDICATOR);
         lv_obj_set_style_bg_opa(bar_7d_, LV_OPA_COVER, LV_PART_INDICATOR);
+
+        // Row 4: Reset ETA (Y = 34)
+        eta_7d_ = lv_label_create(quota_container_);
+        lv_obj_set_pos(eta_7d_, 66, 34);
+        lv_obj_set_size(eta_7d_, 60, 12);
+        lv_obj_set_style_text_align(eta_7d_, LV_TEXT_ALIGN_CENTER, 0);
+        lv_label_set_text(eta_7d_, "rst:--");
 
         quota_visible_ = true;
     }
@@ -117,7 +153,7 @@ public:
         if (!quota_container_) return;
 
         char buf[32];
-        snprintf(buf, sizeof(buf), "5H: %.0f%%", ctx_percent);
+        snprintf(buf, sizeof(buf), "%.0f%%", ctx_percent);
         lv_label_set_text(label_5h_, buf);
 
         if (r5h && r5h[0] && strcmp(r5h, "--") != 0) {
@@ -128,7 +164,7 @@ public:
         }
         lv_bar_set_value(bar_5h_, (int32_t)ctx_percent, LV_ANIM_OFF);
 
-        snprintf(buf, sizeof(buf), "7D: %.0f%%", week_percent);
+        snprintf(buf, sizeof(buf), "%.0f%%", week_percent);
         lv_label_set_text(label_7d_, buf);
 
         if (rwk && rwk[0] && strcmp(rwk, "--") != 0) {
