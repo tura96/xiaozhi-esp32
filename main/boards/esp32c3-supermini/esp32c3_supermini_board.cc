@@ -83,7 +83,17 @@ public:
 
         ESP_ERROR_CHECK(i2s_channel_init_std_mode(tx_handle_, &std_cfg));
         ESP_ERROR_CHECK(i2s_channel_init_std_mode(rx_handle_, &std_cfg));
-        ESP_LOGI(TAG, "Supermini duplex I2S initialized (BCLK=%d, WS=%d, DOUT=%d, DIN=%d)",
+
+        // Enable channels and prime TX DMA buffer with digital silence (zeros)
+        // Keeping continuous BCLK/WS clock running prevents MAX98357A from floating/buzzing at idle
+        ESP_ERROR_CHECK(i2s_channel_enable(tx_handle_));
+        ESP_ERROR_CHECK(i2s_channel_enable(rx_handle_));
+
+        std::vector<int32_t> silence(AUDIO_CODEC_DMA_FRAME_NUM * 4, 0);
+        size_t written = 0;
+        i2s_channel_write(tx_handle_, silence.data(), silence.size() * sizeof(int32_t), &written, pdMS_TO_TICKS(100));
+
+        ESP_LOGI(TAG, "Supermini duplex I2S initialized with continuous clock & silence (BCLK=%d, WS=%d, DOUT=%d, DIN=%d)",
                  bclk, ws, dout, din);
     }
 
@@ -100,48 +110,39 @@ public:
 
     virtual void EnableInput(bool enable) override {
         std::lock_guard<std::mutex> lock(data_if_mutex_);
-        if (enable == input_enabled_) {
-            return;
-        }
-        if (enable) {
-            ESP_ERROR_CHECK(i2s_channel_enable(rx_handle_));
-        } else {
-            ESP_ERROR_CHECK(i2s_channel_disable(rx_handle_));
-        }
+        input_enabled_ = enable;
         AudioCodec::EnableInput(enable);
     }
 
     virtual void EnableOutput(bool enable) override {
         std::lock_guard<std::mutex> lock(data_if_mutex_);
-        if (enable == output_enabled_) {
-            return;
-        }
-        if (enable) {
-            ESP_ERROR_CHECK(i2s_channel_enable(tx_handle_));
-        } else {
-            ESP_ERROR_CHECK(i2s_channel_disable(tx_handle_));
-        }
+        output_enabled_ = enable;
         AudioCodec::EnableOutput(enable);
     }
 
     virtual int Write(const int16_t* data, int samples) override {
         std::lock_guard<std::mutex> lock(data_if_mutex_);
-        if (!tx_handle_ || !output_enabled_ || samples <= 0) return 0;
+        if (!tx_handle_ || samples <= 0) return 0;
 
         std::vector<int32_t> buffer(samples * 2);
-        int32_t volume_factor = pow(double(output_volume_) / 100.0, 2) * 65536;
-        for (int i = 0; i < samples; i++) {
-            int64_t temp = int64_t(data[i]) * volume_factor;
-            int32_t val;
-            if (temp > INT32_MAX) {
-                val = INT32_MAX;
-            } else if (temp < INT32_MIN) {
-                val = INT32_MIN;
-            } else {
-                val = static_cast<int32_t>(temp);
+        if (!output_enabled_) {
+            // Keep transmitting digital zeros so MAX98357A stays clocked and dead silent
+            std::fill(buffer.begin(), buffer.end(), 0);
+        } else {
+            int32_t volume_factor = pow(double(output_volume_) / 100.0, 2) * 65536;
+            for (int i = 0; i < samples; i++) {
+                int64_t temp = int64_t(data[i]) * volume_factor;
+                int32_t val;
+                if (temp > INT32_MAX) {
+                    val = INT32_MAX;
+                } else if (temp < INT32_MIN) {
+                    val = INT32_MIN;
+                } else {
+                    val = static_cast<int32_t>(temp);
+                }
+                buffer[i * 2] = val;
+                buffer[i * 2 + 1] = val;
             }
-            buffer[i * 2] = val;
-            buffer[i * 2 + 1] = val;
         }
 
         size_t bytes_written = 0;
