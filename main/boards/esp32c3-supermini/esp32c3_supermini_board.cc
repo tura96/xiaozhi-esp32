@@ -1,7 +1,7 @@
 #include "wifi_board.h"
 #include "audio_codec.h"
 #include "codecs/no_audio_codec.h"
-#include "supermini_display.h"
+#include "display/oled_display.h"
 #include "application.h"
 #include "button.h"
 #include "config.h"
@@ -13,13 +13,7 @@
 #include <driver/gpio.h>
 #include <esp_lcd_panel_ops.h>
 #include <esp_lcd_panel_vendor.h>
-#include <lwip/sockets.h>
-#include <lwip/netdb.h>
-#include <esp_netif.h>
-#include <wifi_manager.h>
-#include <cJSON.h>
 #include <string>
-#include <vector>
 
 #define TAG "Esp32C3SuperminiBoard"
 
@@ -29,12 +23,6 @@ private:
     esp_lcd_panel_io_handle_t panel_io_ = nullptr;
     esp_lcd_panel_handle_t panel_ = nullptr;
     Display* display_ = nullptr;
-    SuperminiOledDisplay* supermini_display_ = nullptr;
-
-    float last_ctx_ = 0.0f;
-    float last_week_ = 0.0f;
-    std::string last_r5h_ = "--";
-    std::string last_rwk_ = "--";
 
     Button boot_button_;
     Button volume_up_button_;
@@ -94,8 +82,7 @@ private:
         ESP_LOGI(TAG, "Turning display on");
         ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(panel_, true));
 
-        supermini_display_ = new SuperminiOledDisplay(panel_io_, panel_, DISPLAY_WIDTH, DISPLAY_HEIGHT, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y);
-        display_ = supermini_display_;
+        display_ = new OledDisplay(panel_io_, panel_, DISPLAY_WIDTH, DISPLAY_HEIGHT, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y);
     }
 
     void InitializeButtons() {
@@ -167,102 +154,6 @@ private:
                 gpio_set_level(BUZZER_GPIO, 0);
                 return true;
             });
-
-        mcp_server.AddTool("self.quota.get",
-            "Get current Antigravity AI quota remaining percentages and reset ETA",
-            PropertyList(),
-            [this](const PropertyList&) -> ReturnValue {
-                char reply[128];
-                snprintf(reply, sizeof(reply),
-                         "Hạn mức 5 giờ còn %.0f%% (reset sau %s), hạn mức 7 ngày còn %.0f%% (reset sau %s)",
-                         last_ctx_, last_r5h_.c_str(), last_week_, last_rwk_.c_str());
-                return std::string(reply);
-            });
-    }
-
-    void UpdateQuota(float ctx, float week, const char* r5h, const char* rwk) {
-        last_ctx_ = ctx;
-        last_week_ = week;
-        last_r5h_ = (r5h && r5h[0]) ? r5h : "--";
-        last_rwk_ = (rwk && rwk[0]) ? rwk : "--";
-        if (supermini_display_) {
-            supermini_display_->UpdateQuota(ctx, week, r5h, rwk);
-        }
-    }
-
-    static void QuotaListenerTask(void* pvParameters) {
-        auto board = static_cast<Esp32C3SuperminiBoard*>(pvParameters);
-        int sock = -1;
-        char rx_buffer[256];
-
-        while (1) {
-            auto& wifi = WifiManager::GetInstance();
-            if (!wifi.IsConnected() || wifi.GetIpAddress().empty()) {
-                if (sock >= 0) {
-                    close(sock);
-                    sock = -1;
-                }
-                vTaskDelay(pdMS_TO_TICKS(1000));
-                continue;
-            }
-
-            if (sock < 0) {
-                sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
-                if (sock < 0) {
-                    ESP_LOGE(TAG, "Unable to create UDP quota socket");
-                    vTaskDelay(pdMS_TO_TICKS(2000));
-                    continue;
-                }
-
-                struct sockaddr_in saddr = {};
-                saddr.sin_family = AF_INET;
-                saddr.sin_port = htons(58922);
-                saddr.sin_addr.s_addr = htonl(INADDR_ANY);
-
-                int opt = 1;
-                setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-                setsockopt(sock, SOL_SOCKET, SO_BROADCAST, &opt, sizeof(opt));
-
-                struct timeval tv = { .tv_sec = 2, .tv_usec = 0 };
-                setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-
-                if (bind(sock, (struct sockaddr*)&saddr, sizeof(saddr)) < 0) {
-                    ESP_LOGE(TAG, "Failed to bind UDP socket to port 58922");
-                    close(sock);
-                    sock = -1;
-                    vTaskDelay(pdMS_TO_TICKS(2000));
-                    continue;
-                }
-                ESP_LOGI(TAG, "UDP Quota listener successfully bound to 0.0.0.0:58922 (IP: %s)",
-                         wifi.GetIpAddress().c_str());
-            }
-
-            struct sockaddr_in source_addr;
-            socklen_t socklen = sizeof(source_addr);
-            int len = recvfrom(sock, rx_buffer, sizeof(rx_buffer) - 1, 0,
-                               (struct sockaddr*)&source_addr, &socklen);
-            if (len > 0) {
-                rx_buffer[len] = '\0';
-                ESP_LOGI(TAG, "Received UDP quota packet (%d bytes): %s", len, rx_buffer);
-                cJSON* root = cJSON_Parse(rx_buffer);
-                if (root) {
-                    cJSON* ctx_item = cJSON_GetObjectItem(root, "ctx");
-                    cJSON* week_item = cJSON_GetObjectItem(root, "week");
-                    cJSON* r5h_item = cJSON_GetObjectItem(root, "r5h");
-                    cJSON* rwk_item = cJSON_GetObjectItem(root, "rwk");
-                    if (ctx_item && week_item) {
-                        float ctx = (float)ctx_item->valuedouble;
-                        float week = (float)week_item->valuedouble;
-                        const char* r5h = (r5h_item && r5h_item->valuestring) ? r5h_item->valuestring : "--";
-                        const char* rwk = (rwk_item && rwk_item->valuestring) ? rwk_item->valuestring : "--";
-                        board->UpdateQuota(ctx, week, r5h, rwk);
-                    }
-                    cJSON_Delete(root);
-                }
-            } else {
-                vTaskDelay(pdMS_TO_TICKS(50));
-            }
-        }
     }
 
 public:
@@ -274,7 +165,6 @@ public:
         InitializeSsd1306Display();
         InitializeButtons();
         InitializeTools();
-        xTaskCreate(QuotaListenerTask, "quota_listener", 3072, this, 1, nullptr);
     }
 
     virtual AudioCodec* GetAudioCodec() override {
