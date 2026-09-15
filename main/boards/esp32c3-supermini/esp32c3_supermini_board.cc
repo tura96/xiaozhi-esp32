@@ -47,7 +47,7 @@ public:
             .dma_desc_num = AUDIO_CODEC_DMA_DESC_NUM,
             .dma_frame_num = AUDIO_CODEC_DMA_FRAME_NUM,
             .auto_clear_after_cb = true,
-            .auto_clear_before_cb = false,
+            .auto_clear_before_cb = true,
             .intr_priority = 0,
         };
         ESP_ERROR_CHECK(i2s_new_channel(&chan_cfg, &tx_handle_, &rx_handle_));
@@ -83,11 +83,7 @@ public:
 
         ESP_ERROR_CHECK(i2s_channel_init_std_mode(tx_handle_, &std_cfg));
         ESP_ERROR_CHECK(i2s_channel_init_std_mode(rx_handle_, &std_cfg));
-
-        // Enable both TX and RX so the master BCLK/WS clock runs continuously
-        ESP_ERROR_CHECK(i2s_channel_enable(tx_handle_));
-        ESP_ERROR_CHECK(i2s_channel_enable(rx_handle_));
-        ESP_LOGI(TAG, "Supermini duplex I2S initialized and enabled (BCLK=%d, WS=%d, DOUT=%d, DIN=%d)",
+        ESP_LOGI(TAG, "Supermini duplex I2S initialized (BCLK=%d, WS=%d, DOUT=%d, DIN=%d)",
                  bclk, ws, dout, din);
     }
 
@@ -103,16 +99,34 @@ public:
     }
 
     virtual void EnableInput(bool enable) override {
-        input_enabled_ = enable;
+        std::lock_guard<std::mutex> lock(data_if_mutex_);
+        if (enable == input_enabled_) {
+            return;
+        }
+        if (enable) {
+            ESP_ERROR_CHECK(i2s_channel_enable(rx_handle_));
+        } else {
+            ESP_ERROR_CHECK(i2s_channel_disable(rx_handle_));
+        }
+        AudioCodec::EnableInput(enable);
     }
 
     virtual void EnableOutput(bool enable) override {
-        output_enabled_ = enable;
+        std::lock_guard<std::mutex> lock(data_if_mutex_);
+        if (enable == output_enabled_) {
+            return;
+        }
+        if (enable) {
+            ESP_ERROR_CHECK(i2s_channel_enable(tx_handle_));
+        } else {
+            ESP_ERROR_CHECK(i2s_channel_disable(tx_handle_));
+        }
+        AudioCodec::EnableOutput(enable);
     }
 
     virtual int Write(const int16_t* data, int samples) override {
         std::lock_guard<std::mutex> lock(data_if_mutex_);
-        if (!tx_handle_ || samples <= 0) return 0;
+        if (!tx_handle_ || !output_enabled_ || samples <= 0) return 0;
 
         std::vector<int32_t> buffer(samples * 2);
         int32_t volume_factor = pow(double(output_volume_) / 100.0, 2) * 65536;
@@ -139,7 +153,7 @@ public:
     }
 
     virtual int Read(int16_t* dest, int samples) override {
-        if (!rx_handle_ || samples <= 0) return 0;
+        if (!rx_handle_ || !input_enabled_ || samples <= 0) return 0;
 
         size_t bytes_read = 0;
         constexpr uint32_t kReadTimeoutMs = 200;
