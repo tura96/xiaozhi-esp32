@@ -1,6 +1,5 @@
 #include "wifi_board.h"
 #include "audio_codec.h"
-#include "codecs/no_audio_codec.h"
 #include "display/oled_display.h"
 #include "application.h"
 #include "button.h"
@@ -11,11 +10,143 @@
 #include <esp_log.h>
 #include <driver/i2c_master.h>
 #include <driver/gpio.h>
+#include <driver/i2s_std.h>
 #include <esp_lcd_panel_ops.h>
 #include <esp_lcd_panel_vendor.h>
+#include <vector>
+#include <mutex>
 #include <string>
 
 #define TAG "Esp32C3SuperminiBoard"
+
+class SuperminiAudioCodec : public AudioCodec {
+private:
+    std::mutex data_if_mutex_;
+
+public:
+    SuperminiAudioCodec(int input_sample_rate, int output_sample_rate,
+                        gpio_num_t bclk, gpio_num_t ws, gpio_num_t dout, gpio_num_t din) {
+        duplex_ = true;
+        input_sample_rate_ = input_sample_rate;
+        output_sample_rate_ = output_sample_rate;
+        input_channels_ = 1;
+        output_channels_ = 1;
+
+        i2s_chan_config_t chan_cfg = {
+            .id = XIAOZHI_I2S_PORT(0),
+            .role = I2S_ROLE_MASTER,
+            .dma_desc_num = AUDIO_CODEC_DMA_DESC_NUM,
+            .dma_frame_num = AUDIO_CODEC_DMA_FRAME_NUM,
+            .auto_clear_after_cb = true,
+            .auto_clear_before_cb = true,
+            .intr_priority = 0,
+        };
+        ESP_ERROR_CHECK(i2s_new_channel(&chan_cfg, &tx_handle_, &rx_handle_));
+
+        // 16-bit Standard I2S Configuration (Identical to GMeter)
+        i2s_std_config_t std_cfg = {
+            .clk_cfg = {
+                .sample_rate_hz = (uint32_t)output_sample_rate_,
+                .clk_src = I2S_CLK_SRC_DEFAULT,
+                .mclk_multiple = I2S_MCLK_MULTIPLE_256,
+            },
+            .slot_cfg = {
+                .data_bit_width = I2S_DATA_BIT_WIDTH_16BIT,
+                .slot_bit_width = I2S_SLOT_BIT_WIDTH_AUTO,
+                .slot_mode = I2S_SLOT_MODE_MONO,
+                .slot_mask = I2S_STD_SLOT_LEFT,
+                .ws_width = I2S_DATA_BIT_WIDTH_16BIT,
+                .ws_pol = false,
+                .bit_shift = true,
+            },
+            .gpio_cfg = {
+                .mclk = I2S_GPIO_UNUSED,
+                .bclk = bclk,
+                .ws = ws,
+                .dout = dout,
+                .din = din,
+                .invert_flags = {
+                    .mclk_inv = false,
+                    .bclk_inv = false,
+                    .ws_inv = false
+                }
+            }
+        };
+
+        ESP_ERROR_CHECK(i2s_channel_init_std_mode(tx_handle_, &std_cfg));
+        ESP_ERROR_CHECK(i2s_channel_init_std_mode(rx_handle_, &std_cfg));
+
+        // Keep continuous I2S clock running so MAX98357A internal PLL never floats/buzzes
+        ESP_ERROR_CHECK(i2s_channel_enable(tx_handle_));
+        ESP_ERROR_CHECK(i2s_channel_enable(rx_handle_));
+
+        // Prime DMA buffer with digital silence
+        std::vector<int16_t> silence(AUDIO_CODEC_DMA_FRAME_NUM * 4, 0);
+        size_t written = 0;
+        i2s_channel_write(tx_handle_, silence.data(), silence.size() * sizeof(int16_t), &written, pdMS_TO_TICKS(100));
+
+        ESP_LOGI(TAG, "Supermini 16-bit native I2S initialized (BCLK=%d, WS=%d, DOUT=%d, DIN=%d)",
+                 bclk, ws, dout, din);
+    }
+
+    virtual ~SuperminiAudioCodec() {
+        if (rx_handle_) {
+            i2s_channel_disable(rx_handle_);
+            i2s_del_channel(rx_handle_);
+        }
+        if (tx_handle_) {
+            i2s_channel_disable(tx_handle_);
+            i2s_del_channel(tx_handle_);
+        }
+    }
+
+    virtual void EnableInput(bool enable) override {
+        std::lock_guard<std::mutex> lock(data_if_mutex_);
+        input_enabled_ = enable;
+        AudioCodec::EnableInput(enable);
+    }
+
+    virtual void EnableOutput(bool enable) override {
+        std::lock_guard<std::mutex> lock(data_if_mutex_);
+        output_enabled_ = enable;
+        AudioCodec::EnableOutput(enable);
+    }
+
+    virtual int Write(const int16_t* data, int samples) override {
+        std::lock_guard<std::mutex> lock(data_if_mutex_);
+        if (!tx_handle_ || samples <= 0) return 0;
+
+        std::vector<int16_t> buffer(samples);
+        if (!output_enabled_) {
+            std::fill(buffer.begin(), buffer.end(), 0);
+        } else {
+            // Linear volume scaling matching GMeter (prevents 32-bit clipping distortion)
+            float volScale = (float)output_volume_ / 100.0f;
+            for (int i = 0; i < samples; i++) {
+                buffer[i] = (int16_t)(data[i] * volScale);
+            }
+        }
+
+        size_t bytes_written = 0;
+        esp_err_t ret = i2s_channel_write(tx_handle_, buffer.data(), buffer.size() * sizeof(int16_t), &bytes_written, portMAX_DELAY);
+        if (ret != ESP_OK) {
+            return 0;
+        }
+        return bytes_written / sizeof(int16_t);
+    }
+
+    virtual int Read(int16_t* dest, int samples) override {
+        if (!rx_handle_ || !input_enabled_ || samples <= 0) return 0;
+
+        size_t bytes_read = 0;
+        constexpr uint32_t kReadTimeoutMs = 200;
+        esp_err_t ret = i2s_channel_read(rx_handle_, dest, samples * sizeof(int16_t), &bytes_read, kReadTimeoutMs);
+        if (ret != ESP_OK) {
+            return 0;
+        }
+        return bytes_read / sizeof(int16_t);
+    }
+};
 
 class Esp32C3SuperminiBoard : public WifiBoard {
 private:
@@ -168,7 +299,7 @@ public:
     }
 
     virtual AudioCodec* GetAudioCodec() override {
-        static NoAudioCodecDuplex audio_codec(AUDIO_INPUT_SAMPLE_RATE, AUDIO_OUTPUT_SAMPLE_RATE,
+        static SuperminiAudioCodec audio_codec(AUDIO_INPUT_SAMPLE_RATE, AUDIO_OUTPUT_SAMPLE_RATE,
             AUDIO_I2S_GPIO_BCLK, AUDIO_I2S_GPIO_WS, AUDIO_I2S_GPIO_DOUT, AUDIO_I2S_GPIO_DIN);
         return &audio_codec;
     }
