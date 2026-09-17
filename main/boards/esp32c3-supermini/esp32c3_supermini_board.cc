@@ -31,6 +31,7 @@ public:
         output_sample_rate_ = output_sample_rate;
         input_channels_ = 1;
         output_channels_ = 1;
+        input_gain_ = 2.0f; // 2x digital pre-amp boost for INMP441 MEMS mic
 
         i2s_chan_config_t chan_cfg = {
             .id = XIAOZHI_I2S_PORT(0),
@@ -43,7 +44,7 @@ public:
         };
         ESP_ERROR_CHECK(i2s_new_channel(&chan_cfg, &tx_handle_, &rx_handle_));
 
-        // 16-bit Standard I2S Configuration (Identical to GMeter)
+        // 32-bit slot format: Provides the 64 BCLK clock frame required for INMP441 24-bit MEMS microphone
         i2s_std_config_t std_cfg = {
             .clk_cfg = {
                 .sample_rate_hz = (uint32_t)output_sample_rate_,
@@ -51,11 +52,11 @@ public:
                 .mclk_multiple = I2S_MCLK_MULTIPLE_256,
             },
             .slot_cfg = {
-                .data_bit_width = I2S_DATA_BIT_WIDTH_16BIT,
+                .data_bit_width = I2S_DATA_BIT_WIDTH_32BIT,
                 .slot_bit_width = I2S_SLOT_BIT_WIDTH_AUTO,
                 .slot_mode = I2S_SLOT_MODE_MONO,
                 .slot_mask = I2S_STD_SLOT_LEFT,
-                .ws_width = I2S_DATA_BIT_WIDTH_16BIT,
+                .ws_width = I2S_DATA_BIT_WIDTH_32BIT,
                 .ws_pol = false,
                 .bit_shift = true,
             },
@@ -80,12 +81,12 @@ public:
         ESP_ERROR_CHECK(i2s_channel_enable(tx_handle_));
         ESP_ERROR_CHECK(i2s_channel_enable(rx_handle_));
 
-        // Prime DMA buffer with digital silence
-        std::vector<int16_t> silence(AUDIO_CODEC_DMA_FRAME_NUM * 4, 0);
+        // Prime DMA buffer with digital silence (32-bit zeros)
+        std::vector<int32_t> silence(AUDIO_CODEC_DMA_FRAME_NUM * 4, 0);
         size_t written = 0;
-        i2s_channel_write(tx_handle_, silence.data(), silence.size() * sizeof(int16_t), &written, pdMS_TO_TICKS(100));
+        i2s_channel_write(tx_handle_, silence.data(), silence.size() * sizeof(int32_t), &written, pdMS_TO_TICKS(100));
 
-        ESP_LOGI(TAG, "Supermini 16-bit native I2S initialized (BCLK=%d, WS=%d, DOUT=%d, DIN=%d)",
+        ESP_LOGI(TAG, "Supermini 32-bit I2S initialized with INMP441 mic boost (BCLK=%d, WS=%d, DOUT=%d, DIN=%d)",
                  bclk, ws, dout, din);
     }
 
@@ -116,23 +117,23 @@ public:
         std::lock_guard<std::mutex> lock(data_if_mutex_);
         if (!tx_handle_ || samples <= 0) return 0;
 
-        std::vector<int16_t> buffer(samples);
+        std::vector<int32_t> buffer(samples);
         if (!output_enabled_) {
             std::fill(buffer.begin(), buffer.end(), 0);
         } else {
-            // Linear volume scaling matching GMeter (prevents 32-bit clipping distortion)
+            // Smooth linear volume scaling with 6dB headroom to prevent DAC clipping/distortion
             float volScale = (float)output_volume_ / 100.0f;
             for (int i = 0; i < samples; i++) {
-                buffer[i] = (int16_t)(data[i] * volScale);
+                buffer[i] = static_cast<int32_t>(data[i] * volScale) << 14;
             }
         }
 
         size_t bytes_written = 0;
-        esp_err_t ret = i2s_channel_write(tx_handle_, buffer.data(), buffer.size() * sizeof(int16_t), &bytes_written, portMAX_DELAY);
+        esp_err_t ret = i2s_channel_write(tx_handle_, buffer.data(), buffer.size() * sizeof(int32_t), &bytes_written, portMAX_DELAY);
         if (ret != ESP_OK) {
             return 0;
         }
-        return bytes_written / sizeof(int16_t);
+        return bytes_written / sizeof(int32_t);
     }
 
     virtual int Read(int16_t* dest, int samples) override {
@@ -140,11 +141,26 @@ public:
 
         size_t bytes_read = 0;
         constexpr uint32_t kReadTimeoutMs = 200;
-        esp_err_t ret = i2s_channel_read(rx_handle_, dest, samples * sizeof(int16_t), &bytes_read, kReadTimeoutMs);
+        std::vector<int32_t> bit32_buf(samples);
+
+        esp_err_t ret = i2s_channel_read(rx_handle_, bit32_buf.data(), samples * sizeof(int32_t), &bytes_read, kReadTimeoutMs);
         if (ret != ESP_OK) {
             return 0;
         }
-        return bytes_read / sizeof(int16_t);
+
+        int read_samples = bytes_read / sizeof(int32_t);
+        float gain_factor = (input_gain_ > 0) ? input_gain_ : 1.0f;
+
+        for (int i = 0; i < read_samples; i++) {
+            // INMP441 24-bit data is in upper 24 bits.
+            // Shifting >> 11 with gain_factor provides clear, loud, sensitive voice capture.
+            int32_t val = (bit32_buf[i] >> 11);
+            if (gain_factor != 1.0f) {
+                val = static_cast<int32_t>(val * gain_factor);
+            }
+            dest[i] = (val > INT16_MAX) ? INT16_MAX : (val < -INT16_MAX) ? -INT16_MAX : static_cast<int16_t>(val);
+        }
+        return read_samples;
     }
 };
 
