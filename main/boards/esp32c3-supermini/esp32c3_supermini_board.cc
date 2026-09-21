@@ -1,6 +1,6 @@
 #include "wifi_board.h"
 #include "audio_codec.h"
-#include "supermini_display.h"
+#include "display/oled_display.h"
 #include "application.h"
 #include "button.h"
 #include "config.h"
@@ -13,11 +13,6 @@
 #include <driver/i2s_std.h>
 #include <esp_lcd_panel_ops.h>
 #include <esp_lcd_panel_vendor.h>
-#include <lwip/sockets.h>
-#include <lwip/netdb.h>
-#include <esp_netif.h>
-#include <wifi_manager.h>
-#include <cJSON.h>
 #include <vector>
 #include <mutex>
 #include <string>
@@ -27,6 +22,8 @@
 class SuperminiAudioCodec : public AudioCodec {
 private:
     std::mutex data_if_mutex_;
+    float dc_x_ = 0.0f;
+    float dc_y_ = 0.0f;
 
 public:
     SuperminiAudioCodec(int input_sample_rate, int output_sample_rate,
@@ -36,7 +33,7 @@ public:
         output_sample_rate_ = output_sample_rate;
         input_channels_ = 1;
         output_channels_ = 1;
-        input_gain_ = 2.0f; // 2x digital pre-amp boost for INMP441 MEMS mic
+        input_gain_ = 3.0f; // 3x digital pre-amp boost for high sensitivity
 
         i2s_chan_config_t chan_cfg = {
             .id = XIAOZHI_I2S_PORT(0),
@@ -91,7 +88,7 @@ public:
         size_t written = 0;
         i2s_channel_write(tx_handle_, silence.data(), silence.size() * sizeof(int32_t), &written, pdMS_TO_TICKS(100));
 
-        ESP_LOGI(TAG, "Supermini 32-bit I2S initialized with INMP441 mic boost (BCLK=%d, WS=%d, DOUT=%d, DIN=%d)",
+        ESP_LOGI(TAG, "Supermini 32-bit I2S initialized with full-volume DAC & INMP441 DC-filter (BCLK=%d, WS=%d, DOUT=%d, DIN=%d)",
                  bclk, ws, dout, din);
     }
 
@@ -126,10 +123,11 @@ public:
         if (!output_enabled_) {
             std::fill(buffer.begin(), buffer.end(), 0);
         } else {
-            // Smooth linear volume scaling with 6dB headroom to prevent DAC clipping/distortion
-            float volScale = (float)output_volume_ / 100.0f;
+            // 100% full scale volume scaling (shifted << 16 for MAX98357A 32-bit slot)
+            float vol = static_cast<float>(output_volume_) / 100.0f;
             for (int i = 0; i < samples; i++) {
-                buffer[i] = static_cast<int32_t>(data[i] * volScale) << 14;
+                int32_t sample = static_cast<int32_t>(data[i] * vol);
+                buffer[i] = sample << 16;
             }
         }
 
@@ -157,13 +155,23 @@ public:
         float gain_factor = (input_gain_ > 0) ? input_gain_ : 1.0f;
 
         for (int i = 0; i < read_samples; i++) {
-            // INMP441 24-bit data is in upper 24 bits.
-            // Shifting >> 11 with gain_factor provides clear, loud, sensitive voice capture.
-            int32_t val = (bit32_buf[i] >> 11);
-            if (gain_factor != 1.0f) {
-                val = static_cast<int32_t>(val * gain_factor);
+            // INMP441 24-bit MSB data in 32-bit slot
+            int32_t raw = bit32_buf[i] >> 14;
+            float in_val = static_cast<float>(raw);
+
+            // DC-blocking high-pass filter (cutoff ~15Hz at 16kHz sample rate)
+            float filtered = in_val - dc_x_ + 0.995f * dc_y_;
+            dc_x_ = in_val;
+            dc_y_ = filtered;
+
+            // Apply pre-amp boost with soft clipping
+            float val = filtered * gain_factor;
+            if (val > 32767.0f) {
+                val = 32767.0f;
+            } else if (val < -32768.0f) {
+                val = -32768.0f;
             }
-            dest[i] = (val > INT16_MAX) ? INT16_MAX : (val < -INT16_MAX) ? -INT16_MAX : static_cast<int16_t>(val);
+            dest[i] = static_cast<int16_t>(val);
         }
         return read_samples;
     }
@@ -175,12 +183,6 @@ private:
     esp_lcd_panel_io_handle_t panel_io_ = nullptr;
     esp_lcd_panel_handle_t panel_ = nullptr;
     Display* display_ = nullptr;
-    SuperminiOledDisplay* supermini_display_ = nullptr;
-
-    float last_ctx_ = 0.0f;
-    float last_week_ = 0.0f;
-    std::string last_r5h_ = "--";
-    std::string last_rwk_ = "--";
 
     Button boot_button_;
     Button volume_up_button_;
@@ -240,8 +242,7 @@ private:
         ESP_LOGI(TAG, "Turning display on");
         ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(panel_, true));
 
-        supermini_display_ = new SuperminiOledDisplay(panel_io_, panel_, DISPLAY_WIDTH, DISPLAY_HEIGHT, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y);
-        display_ = supermini_display_;
+        display_ = new OledDisplay(panel_io_, panel_, DISPLAY_WIDTH, DISPLAY_HEIGHT, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y);
     }
 
     void InitializeButtons() {
@@ -313,102 +314,6 @@ private:
                 gpio_set_level(BUZZER_GPIO, 0);
                 return true;
             });
-
-        mcp_server.AddTool("self.quota.get",
-            "Get current Antigravity AI quota remaining percentages and reset ETA",
-            PropertyList(),
-            [this](const PropertyList&) -> ReturnValue {
-                char reply[128];
-                snprintf(reply, sizeof(reply),
-                         "Hạn mức 5 giờ còn %.0f%% (reset sau %s), hạn mức 7 ngày còn %.0f%% (reset sau %s)",
-                         last_ctx_, last_r5h_.c_str(), last_week_, last_rwk_.c_str());
-                return std::string(reply);
-            });
-    }
-
-    void UpdateQuota(float ctx, float week, const char* r5h, const char* rwk) {
-        last_ctx_ = ctx;
-        last_week_ = week;
-        last_r5h_ = (r5h && r5h[0]) ? r5h : "--";
-        last_rwk_ = (rwk && rwk[0]) ? rwk : "--";
-        if (supermini_display_) {
-            supermini_display_->UpdateQuota(ctx, week, r5h, rwk);
-        }
-    }
-
-    static void QuotaListenerTask(void* pvParameters) {
-        auto board = static_cast<Esp32C3SuperminiBoard*>(pvParameters);
-        int sock = -1;
-        char rx_buffer[256];
-
-        while (1) {
-            auto& wifi = WifiManager::GetInstance();
-            if (!wifi.IsConnected() || wifi.GetIpAddress().empty()) {
-                if (sock >= 0) {
-                    close(sock);
-                    sock = -1;
-                }
-                vTaskDelay(pdMS_TO_TICKS(1000));
-                continue;
-            }
-
-            if (sock < 0) {
-                sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
-                if (sock < 0) {
-                    ESP_LOGE(TAG, "Unable to create UDP quota socket");
-                    vTaskDelay(pdMS_TO_TICKS(2000));
-                    continue;
-                }
-
-                struct sockaddr_in saddr = {};
-                saddr.sin_family = AF_INET;
-                saddr.sin_port = htons(58922);
-                saddr.sin_addr.s_addr = htonl(INADDR_ANY);
-
-                int opt = 1;
-                setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-                setsockopt(sock, SOL_SOCKET, SO_BROADCAST, &opt, sizeof(opt));
-
-                struct timeval tv = { .tv_sec = 2, .tv_usec = 0 };
-                setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-
-                if (bind(sock, (struct sockaddr*)&saddr, sizeof(saddr)) < 0) {
-                    ESP_LOGE(TAG, "Failed to bind UDP socket to port 58922");
-                    close(sock);
-                    sock = -1;
-                    vTaskDelay(pdMS_TO_TICKS(2000));
-                    continue;
-                }
-                ESP_LOGI(TAG, "UDP Quota listener successfully bound to 0.0.0.0:58922 (IP: %s)",
-                         wifi.GetIpAddress().c_str());
-            }
-
-            struct sockaddr_in source_addr;
-            socklen_t socklen = sizeof(source_addr);
-            int len = recvfrom(sock, rx_buffer, sizeof(rx_buffer) - 1, 0,
-                               (struct sockaddr*)&source_addr, &socklen);
-            if (len > 0) {
-                rx_buffer[len] = '\0';
-                ESP_LOGI(TAG, "Received UDP quota packet (%d bytes): %s", len, rx_buffer);
-                cJSON* root = cJSON_Parse(rx_buffer);
-                if (root) {
-                    cJSON* ctx_item = cJSON_GetObjectItem(root, "ctx");
-                    cJSON* week_item = cJSON_GetObjectItem(root, "week");
-                    cJSON* r5h_item = cJSON_GetObjectItem(root, "r5h");
-                    cJSON* rwk_item = cJSON_GetObjectItem(root, "rwk");
-                    if (ctx_item && week_item) {
-                        float ctx = (float)ctx_item->valuedouble;
-                        float week = (float)week_item->valuedouble;
-                        const char* r5h = (r5h_item && r5h_item->valuestring) ? r5h_item->valuestring : "--";
-                        const char* rwk = (rwk_item && rwk_item->valuestring) ? rwk_item->valuestring : "--";
-                        board->UpdateQuota(ctx, week, r5h, rwk);
-                    }
-                    cJSON_Delete(root);
-                }
-            } else {
-                vTaskDelay(pdMS_TO_TICKS(50));
-            }
-        }
     }
 
 public:
@@ -420,7 +325,6 @@ public:
         InitializeSsd1306Display();
         InitializeButtons();
         InitializeTools();
-        xTaskCreate(QuotaListenerTask, "quota_listener", 3072, this, 1, nullptr);
     }
 
     virtual AudioCodec* GetAudioCodec() override {
