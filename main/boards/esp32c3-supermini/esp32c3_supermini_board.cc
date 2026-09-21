@@ -7,12 +7,15 @@
 #include "mcp_server.h"
 #include "press_to_talk_mcp_tool.h"
 #include "assets/lang_config.h"
+#include "wifi_manager.h"
 
 #include <esp_log.h>
 #include <driver/i2c_master.h>
 #include <driver/gpio.h>
 #include <esp_lcd_panel_ops.h>
 #include <esp_lcd_panel_vendor.h>
+#include <esp_system.h>
+#include <ctime>
 
 #define TAG "Esp32C3SuperminiBoard"
 
@@ -22,6 +25,13 @@ private:
     esp_lcd_panel_io_handle_t panel_io_ = nullptr;
     esp_lcd_panel_handle_t panel_ = nullptr;
     Display* display_ = nullptr;
+
+    enum ScreenMode {
+        kScreenDark = 0,
+        kScreenLight = 1,
+        kScreenSleep = 2
+    };
+    ScreenMode screen_mode_ = kScreenDark;
 
     Button boot_button_;
     Button volume_up_button_;
@@ -85,9 +95,56 @@ private:
         display_ = new OledDisplay(panel_io_, panel_, DISPLAY_WIDTH, DISPLAY_HEIGHT, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y);
     }
 
+    void CycleScreenMode() {
+        if (!panel_) return;
+        if (screen_mode_ == kScreenDark) {
+            screen_mode_ = kScreenLight;
+            esp_lcd_panel_disp_on_off(panel_, true);
+            esp_lcd_panel_invert_color(panel_, true);
+            GetDisplay()->ShowNotification("Light Mode", 2000);
+        } else if (screen_mode_ == kScreenLight) {
+            screen_mode_ = kScreenSleep;
+            esp_lcd_panel_disp_on_off(panel_, false);
+        } else {
+            screen_mode_ = kScreenDark;
+            esp_lcd_panel_disp_on_off(panel_, true);
+            esp_lcd_panel_invert_color(panel_, false);
+            GetDisplay()->ShowNotification("Dark Mode", 2000);
+        }
+    }
+
+    void EnsureScreenAwake() {
+        if (screen_mode_ == kScreenSleep && panel_) {
+            screen_mode_ = kScreenDark;
+            esp_lcd_panel_disp_on_off(panel_, true);
+            esp_lcd_panel_invert_color(panel_, false);
+        }
+    }
+
+    void ShowDeskSystemInfo() {
+        auto& wifi = WifiManager::GetInstance();
+        time_t now = time(nullptr);
+        struct tm tm_info;
+        localtime_r(&now, &tm_info);
+
+        char buf[64];
+        if (tm_info.tm_year > 120) {
+            snprintf(buf, sizeof(buf), "%02d:%02d | %s | %luKB",
+                     tm_info.tm_hour, tm_info.tm_min,
+                     wifi.GetIpAddress().empty() ? "Offline" : wifi.GetIpAddress().c_str(),
+                     (unsigned long)(esp_get_free_heap_size() / 1024));
+        } else {
+            snprintf(buf, sizeof(buf), "IP: %s | RAM: %luKB",
+                     wifi.GetIpAddress().empty() ? "Offline" : wifi.GetIpAddress().c_str(),
+                     (unsigned long)(esp_get_free_heap_size() / 1024));
+        }
+        GetDisplay()->ShowNotification(buf, 6000);
+    }
+
     void InitializeButtons() {
         // Key 1 (GPIO 0): PTT / Toggle Chat / Wi-Fi Config
         boot_button_.OnClick([this]() {
+            EnsureScreenAwake();
             auto& app = Application::GetInstance();
             if (app.GetDeviceState() == kDeviceStateStarting) {
                 EnterWifiConfigMode();
@@ -98,6 +155,7 @@ private:
             }
         });
         boot_button_.OnPressDown([this]() {
+            EnsureScreenAwake();
             if (press_to_talk_tool_ && press_to_talk_tool_->IsPressToTalkEnabled()) {
                 Application::GetInstance().StartListening();
             }
@@ -108,8 +166,9 @@ private:
             }
         });
 
-        // Key 2 (GPIO 1): Volume Up
+        // Key 2 (GPIO 1): Volume Up / Screen Mode (Light - Dark - Sleep)
         volume_up_button_.OnClick([this]() {
+            EnsureScreenAwake();
             auto codec = GetAudioCodec();
             auto volume = codec->output_volume() + 10;
             if (volume > 100) {
@@ -118,13 +177,18 @@ private:
             codec->SetOutputVolume(volume);
             GetDisplay()->ShowNotification(Lang::Strings::VOLUME + std::to_string(volume));
         });
+        volume_up_button_.OnDoubleClick([this]() {
+            CycleScreenMode();
+        });
         volume_up_button_.OnLongPress([this]() {
+            EnsureScreenAwake();
             GetAudioCodec()->SetOutputVolume(100);
             GetDisplay()->ShowNotification(Lang::Strings::MAX_VOLUME);
         });
 
-        // Key 3 (GPIO 3): Volume Down / Mute
+        // Key 3 (GPIO 3): Volume Down / Mute / Desk Info
         volume_down_button_.OnClick([this]() {
+            EnsureScreenAwake();
             auto codec = GetAudioCodec();
             auto volume = codec->output_volume() - 10;
             if (volume < 0) {
@@ -133,7 +197,12 @@ private:
             codec->SetOutputVolume(volume);
             GetDisplay()->ShowNotification(Lang::Strings::VOLUME + std::to_string(volume));
         });
+        volume_down_button_.OnDoubleClick([this]() {
+            EnsureScreenAwake();
+            ShowDeskSystemInfo();
+        });
         volume_down_button_.OnLongPress([this]() {
+            EnsureScreenAwake();
             GetAudioCodec()->SetOutputVolume(0);
             GetDisplay()->ShowNotification(Lang::Strings::MUTED);
         });
