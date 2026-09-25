@@ -22,118 +22,12 @@
 
 #define TAG "Esp32C3SuperminiBoard"
 
-class SuperminiMicTesterDisplay : public OledDisplay {
-private:
-    lv_obj_t* test_container_ = nullptr;
-    lv_obj_t* label_title_ = nullptr;
-    lv_obj_t* label_val_ = nullptr;
-    lv_obj_t* label_status_ = nullptr;
-    lv_obj_t* bars_[16];
-
-public:
-    SuperminiMicTesterDisplay(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_handle_t panel,
-                              int width, int height, bool mirror_x, bool mirror_y)
-        : OledDisplay(panel_io, panel, width, height, mirror_x, mirror_y) {}
-
-    virtual void SetupUI() override {
-        OledDisplay::SetupUI();
-
-        DisplayLockGuard lock(this);
-        auto screen = lv_screen_active();
-
-        test_container_ = lv_obj_create(screen);
-        lv_obj_set_pos(test_container_, 0, 0);
-        lv_obj_set_size(test_container_, 128, 64);
-        lv_obj_set_style_pad_all(test_container_, 0, 0);
-        lv_obj_set_style_border_width(test_container_, 0, 0);
-        lv_obj_set_style_radius(test_container_, 0, 0);
-        lv_obj_set_style_bg_opa(test_container_, LV_OPA_COVER, 0);
-        lv_obj_set_style_bg_color(test_container_, lv_color_black(), 0);
-        lv_obj_remove_flag(test_container_, LV_OBJ_FLAG_SCROLLABLE);
-
-        // Header Title
-        label_title_ = lv_label_create(test_container_);
-        lv_obj_set_pos(label_title_, 2, 0);
-        lv_label_set_text(label_title_, "MIC OSCILLOSCOPE");
-
-        // Peak / RMS info
-        label_val_ = lv_label_create(test_container_);
-        lv_obj_set_pos(label_val_, 2, 14);
-        lv_label_set_text(label_val_, "Peak: 0 | RMS: 0");
-
-        // Status string
-        label_status_ = lv_label_create(test_container_);
-        lv_obj_set_pos(label_status_, 2, 28);
-        lv_label_set_text(label_status_, "WAITING SIGNAL...");
-
-        // 16 Vertical Wave Bars using basic lv_obj_create (X: 0 to 127, base Y: 62)
-        for (int i = 0; i < 16; i++) {
-            bars_[i] = lv_obj_create(test_container_);
-            lv_obj_set_pos(bars_[i], i * 8, 61);
-            lv_obj_set_size(bars_[i], 6, 2);
-            lv_obj_set_style_pad_all(bars_[i], 0, 0);
-            lv_obj_set_style_radius(bars_[i], 0, 0);
-            lv_obj_set_style_border_width(bars_[i], 0, 0);
-            lv_obj_set_style_bg_color(bars_[i], lv_color_white(), 0);
-            lv_obj_set_style_bg_opa(bars_[i], LV_OPA_COVER, 0);
-            lv_obj_remove_flag(bars_[i], LV_OBJ_FLAG_SCROLLABLE);
-        }
-    }
-
-    void SetPlayingStatus(bool is_playing) {
-        DisplayLockGuard lock(this);
-        if (!label_status_) return;
-        if (is_playing) {
-            lv_label_set_text(label_status_, ">> PLAYING ECHO... <<");
-        }
-    }
-
-    void UpdateWaveform(const int16_t* samples, int count, int32_t peak, int32_t rms, bool is_playing = false) {
-        DisplayLockGuard lock(this);
-        if (!test_container_) return;
-
-        // Update 16 bars with amplitude of 16 subdivisions
-        int chunk_size = (count >= 16) ? (count / 16) : 1;
-        for (int i = 0; i < 16; i++) {
-            int32_t sub_peak = 0;
-            for (int j = 0; j < chunk_size; j++) {
-                int idx = i * chunk_size + j;
-                if (idx < count) {
-                    int32_t v = std::abs(samples[idx]);
-                    if (v > sub_peak) sub_peak = v;
-                }
-            }
-            int h = (sub_peak * 22) / 32768;
-            if (h < 1) h = 1;
-            if (h > 22) h = 22;
-            lv_obj_set_pos(bars_[i], i * 8, 63 - h);
-            lv_obj_set_size(bars_[i], 6, h);
-        }
-
-        // Update Labels
-        char buf[32];
-        snprintf(buf, sizeof(buf), "Pk:%ld R:%ld", (long)peak, (long)rms);
-        lv_label_set_text(label_val_, buf);
-
-        if (is_playing) {
-            lv_label_set_text(label_status_, "PLAYING ECHO TO SPK");
-        } else if (peak <= 50) {
-            lv_label_set_text(label_status_, "NO SIGNAL (Check Mic)");
-        } else if (peak > 15000) {
-            lv_label_set_text(label_status_, "MIC OK [Key1: Play]");
-        } else {
-            lv_label_set_text(label_status_, "MIC OK [Key1: Play]");
-        }
-    }
-};
-
 class Esp32C3SuperminiBoard : public WifiBoard {
 private:
     i2c_master_bus_handle_t display_i2c_bus_ = nullptr;
     esp_lcd_panel_io_handle_t panel_io_ = nullptr;
     esp_lcd_panel_handle_t panel_ = nullptr;
     Display* display_ = nullptr;
-    SuperminiMicTesterDisplay* mic_display_ = nullptr;
 
     Button boot_button_;
     Button volume_up_button_;
@@ -195,8 +89,7 @@ private:
         ESP_LOGI(TAG, "Turning display on");
         ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(panel_, true));
 
-        mic_display_ = new SuperminiMicTesterDisplay(panel_io_, panel_, DISPLAY_WIDTH, DISPLAY_HEIGHT, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y);
-        display_ = mic_display_;
+        display_ = new OledDisplay(panel_io_, panel_, DISPLAY_WIDTH, DISPLAY_HEIGHT, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y);
     }
 
     void InitializeButtons() {
@@ -236,13 +129,17 @@ private:
         size_t write_pos = 0;
         std::vector<int16_t> chunk(kChunkSamples);
         int log_counter = 0;
+        int display_update_counter = 0;
+
+        vTaskDelay(pdMS_TO_TICKS(1000)); // Wait for display to initialize
 
         while (1) {
             // Check if user requested Key1 playback
             if (board->play_echo_requested_.exchange(false)) {
                 ESP_LOGI("MicTester", "Starting Echo Playback (%d samples)...", (int)kRingCapacity);
-                if (board->mic_display_) {
-                    board->mic_display_->SetPlayingStatus(true);
+                if (board->display_) {
+                    board->display_->SetStatus("PLAYING ECHO...");
+                    board->display_->SetChatMessage("system", "Playing to speaker...\nListen closely");
                 }
 
                 // Playback ring buffer from oldest to newest
@@ -251,29 +148,21 @@ private:
                 std::vector<int16_t> play_chunk(kPlayChunk);
 
                 for (size_t total_played = 0; total_played < kRingCapacity; total_played += kPlayChunk) {
-                    int32_t play_peak = 0;
-                    int64_t play_sum_sq = 0;
                     for (int i = 0; i < kPlayChunk; i++) {
-                        int16_t val = ring_buffer[(play_read_pos + i) % kRingCapacity];
-                        play_chunk[i] = val;
-                        int32_t abs_val = std::abs(val);
-                        if (abs_val > play_peak) play_peak = abs_val;
-                        play_sum_sq += int64_t(val) * val;
+                        play_chunk[i] = ring_buffer[(play_read_pos + i) % kRingCapacity];
                     }
                     play_read_pos = (play_read_pos + kPlayChunk) % kRingCapacity;
-                    int32_t play_rms = static_cast<int32_t>(std::sqrt(play_sum_sq / kPlayChunk));
 
                     codec->Write(play_chunk.data(), kPlayChunk);
-
-                    if (board->mic_display_) {
-                        board->mic_display_->UpdateWaveform(play_chunk.data(), kPlayChunk, play_peak, play_rms, true);
-                    }
                     vTaskDelay(pdMS_TO_TICKS(15));
                 }
                 ESP_LOGI("MicTester", "Echo Playback Finished.");
+                if (board->display_) {
+                    board->display_->SetStatus("ECHO FINISHED");
+                }
             }
 
-            // Normal microphone recording & OLED visualizer
+            // Normal microphone recording
             int read_count = codec->Read(chunk.data(), kChunkSamples);
             if (read_count > 0) {
                 int32_t peak = 0;
@@ -289,9 +178,20 @@ private:
                 }
                 int32_t rms = static_cast<int32_t>(std::sqrt(sum_sq / read_count));
 
-                // Update OLED waveform in real-time
-                if (board->mic_display_) {
-                    board->mic_display_->UpdateWaveform(chunk.data(), read_count, peak, rms, false);
+                // Update Display every ~200ms
+                if (++display_update_counter >= 10) {
+                    display_update_counter = 0;
+                    if (board->display_) {
+                        char msg_buf[64];
+                        if (peak <= 50) {
+                            board->display_->SetStatus("NO MIC SIGNAL");
+                            snprintf(msg_buf, sizeof(msg_buf), "Pk:%ld R:%ld\nCheck Mic Soldering", (long)peak, (long)rms);
+                        } else {
+                            board->display_->SetStatus("MIC DETECTED!");
+                            snprintf(msg_buf, sizeof(msg_buf), "Pk:%ld R:%ld\n[Key1: Replay Echo]", (long)peak, (long)rms);
+                        }
+                        board->display_->SetChatMessage("mic", msg_buf);
+                    }
                 }
 
                 if (++log_counter >= 10) {
@@ -326,4 +226,3 @@ public:
 };
 
 DECLARE_BOARD(Esp32C3SuperminiBoard);
-
