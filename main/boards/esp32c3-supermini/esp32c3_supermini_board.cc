@@ -15,9 +15,108 @@
 #include <esp_lcd_panel_ops.h>
 #include <esp_lcd_panel_vendor.h>
 #include <esp_system.h>
-#include <ctime>
+#include <cmath>
+#include <vector>
+#include <cstdlib>
 
 #define TAG "Esp32C3SuperminiBoard"
+
+class SuperminiMicTesterDisplay : public OledDisplay {
+private:
+    lv_obj_t* test_container_ = nullptr;
+    lv_obj_t* label_title_ = nullptr;
+    lv_obj_t* label_val_ = nullptr;
+    lv_obj_t* wave_line_ = nullptr;
+    lv_obj_t* vu_bar_ = nullptr;
+    lv_point_precise_t points_[64];
+
+public:
+    SuperminiMicTesterDisplay(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_handle_t panel,
+                              int width, int height, bool mirror_x, bool mirror_y)
+        : OledDisplay(panel_io, panel, width, height, mirror_x, mirror_y) {}
+
+    virtual void SetupUI() override {
+        OledDisplay::SetupUI();
+
+        DisplayLockGuard lock(this);
+        auto screen = lv_screen_active();
+
+        test_container_ = lv_obj_create(screen);
+        lv_obj_set_pos(test_container_, 0, 0);
+        lv_obj_set_size(test_container_, 128, 64);
+        lv_obj_set_style_pad_all(test_container_, 0, 0);
+        lv_obj_set_style_border_width(test_container_, 0, 0);
+        lv_obj_set_style_radius(test_container_, 0, 0);
+        lv_obj_set_style_bg_opa(test_container_, LV_OPA_COVER, 0);
+        lv_obj_set_style_bg_color(test_container_, lv_color_black(), 0);
+        lv_obj_remove_flag(test_container_, LV_OBJ_FLAG_SCROLLABLE);
+
+        // Header Title
+        label_title_ = lv_label_create(test_container_);
+        lv_obj_set_pos(label_title_, 2, 0);
+        lv_label_set_text(label_title_, "MIC OSCILLOSCOPE");
+
+        // Peak / RMS info
+        label_val_ = lv_label_create(test_container_);
+        lv_obj_set_pos(label_val_, 2, 14);
+        lv_label_set_text(label_val_, "Peak: 0 | RMS: 0");
+
+        // Waveform Line (64 points across 128px)
+        for (int i = 0; i < 64; i++) {
+            points_[i].x = i * 2;
+            points_[i].y = 40;
+        }
+        wave_line_ = lv_line_create(test_container_);
+        lv_line_set_points(wave_line_, points_, 64);
+        lv_obj_set_style_line_width(wave_line_, 1, 0);
+        lv_obj_set_style_line_color(wave_line_, lv_color_white(), 0);
+
+        // VU meter bar at bottom
+        vu_bar_ = lv_bar_create(test_container_);
+        lv_obj_set_pos(vu_bar_, 0, 58);
+        lv_obj_set_size(vu_bar_, 128, 6);
+        lv_bar_set_range(vu_bar_, 0, 100);
+        lv_bar_set_value(vu_bar_, 0, LV_ANIM_OFF);
+        lv_obj_set_style_radius(vu_bar_, 0, 0);
+        lv_obj_set_style_radius(vu_bar_, 0, LV_PART_INDICATOR);
+        lv_obj_set_style_border_width(vu_bar_, 0, 0);
+        lv_obj_set_style_bg_color(vu_bar_, lv_color_black(), 0);
+        lv_obj_set_style_bg_color(vu_bar_, lv_color_white(), LV_PART_INDICATOR);
+    }
+
+    void UpdateWaveform(const int16_t* samples, int count, int32_t peak, int32_t rms) {
+        DisplayLockGuard lock(this);
+        if (!test_container_) return;
+
+        // Downsample to 64 points
+        int step = (count >= 64) ? (count / 64) : 1;
+        for (int i = 0; i < 64; i++) {
+            int idx = i * step;
+            if (idx >= count) idx = count - 1;
+            int16_t s = samples[idx];
+            // Center is Y = 40, range +/- 16px
+            int y = 40 - (s * 16 / 32768);
+            if (y < 24) y = 24;
+            if (y > 56) y = 56;
+            points_[i].y = y;
+        }
+        lv_line_set_points(wave_line_, points_, 64);
+
+        // Update Labels
+        char buf[32];
+        if (peak == 0) {
+            snprintf(buf, sizeof(buf), "NO SIGNAL (0)");
+        } else {
+            snprintf(buf, sizeof(buf), "Pk:%ld R:%ld", (long)peak, (long)rms);
+        }
+        lv_label_set_text(label_val_, buf);
+
+        // Update VU Bar (0 - 100%)
+        int pct = (peak * 100) / 32768;
+        if (pct > 100) pct = 100;
+        lv_bar_set_value(vu_bar_, pct, LV_ANIM_OFF);
+    }
+};
 
 class Esp32C3SuperminiBoard : public WifiBoard {
 private:
@@ -25,18 +124,11 @@ private:
     esp_lcd_panel_io_handle_t panel_io_ = nullptr;
     esp_lcd_panel_handle_t panel_ = nullptr;
     Display* display_ = nullptr;
-
-    enum ScreenMode {
-        kScreenDark = 0,
-        kScreenLight = 1,
-        kScreenSleep = 2
-    };
-    ScreenMode screen_mode_ = kScreenDark;
+    SuperminiMicTesterDisplay* mic_display_ = nullptr;
 
     Button boot_button_;
     Button volume_up_button_;
     Button volume_down_button_;
-    PressToTalkMcpTool* press_to_talk_tool_ = nullptr;
 
     void InitializeDisplayI2c() {
         i2c_master_bus_config_t bus_config = {
@@ -92,149 +184,73 @@ private:
         ESP_LOGI(TAG, "Turning display on");
         ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(panel_, true));
 
-        display_ = new OledDisplay(panel_io_, panel_, DISPLAY_WIDTH, DISPLAY_HEIGHT, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y);
-    }
-
-    void CycleScreenMode() {
-        if (!panel_) return;
-        if (screen_mode_ == kScreenDark) {
-            screen_mode_ = kScreenLight;
-            esp_lcd_panel_disp_on_off(panel_, true);
-            esp_lcd_panel_invert_color(panel_, true);
-            GetDisplay()->ShowNotification("Light Mode", 2000);
-        } else if (screen_mode_ == kScreenLight) {
-            screen_mode_ = kScreenSleep;
-            esp_lcd_panel_disp_on_off(panel_, false);
-        } else {
-            screen_mode_ = kScreenDark;
-            esp_lcd_panel_disp_on_off(panel_, true);
-            esp_lcd_panel_invert_color(panel_, false);
-            GetDisplay()->ShowNotification("Dark Mode", 2000);
-        }
-    }
-
-    void EnsureScreenAwake() {
-        if (screen_mode_ == kScreenSleep && panel_) {
-            screen_mode_ = kScreenDark;
-            esp_lcd_panel_disp_on_off(panel_, true);
-            esp_lcd_panel_invert_color(panel_, false);
-        }
-    }
-
-    void ShowDeskSystemInfo() {
-        auto& wifi = WifiManager::GetInstance();
-        time_t now = time(nullptr);
-        struct tm tm_info;
-        localtime_r(&now, &tm_info);
-
-        char time_str[16];
-        if (tm_info.tm_year > 120) {
-            snprintf(time_str, sizeof(time_str), "%02d:%02d:%02d",
-                     tm_info.tm_hour, tm_info.tm_min, tm_info.tm_sec);
-        } else {
-            snprintf(time_str, sizeof(time_str), "Ready");
-        }
-
-        char info_str[48];
-        snprintf(info_str, sizeof(info_str), "IP: %s\nRAM: %luKB",
-                 wifi.GetIpAddress().empty() ? "Offline" : wifi.GetIpAddress().c_str(),
-                 (unsigned long)(esp_get_free_heap_size() / 1024));
-
-        GetDisplay()->SetStatus(time_str);
-        GetDisplay()->SetChatMessage("system", info_str);
+        mic_display_ = new SuperminiMicTesterDisplay(panel_io_, panel_, DISPLAY_WIDTH, DISPLAY_HEIGHT, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y);
+        display_ = mic_display_;
     }
 
     void InitializeButtons() {
-        // Key 1 (GPIO 0): PTT / Toggle Chat / Wi-Fi Config
         boot_button_.OnClick([this]() {
-            EnsureScreenAwake();
             auto& app = Application::GetInstance();
             if (app.GetDeviceState() == kDeviceStateStarting) {
                 EnterWifiConfigMode();
                 return;
             }
-            if (!press_to_talk_tool_ || !press_to_talk_tool_->IsPressToTalkEnabled()) {
-                app.ToggleChatState();
-            }
-        });
-        boot_button_.OnPressDown([this]() {
-            EnsureScreenAwake();
-            if (press_to_talk_tool_ && press_to_talk_tool_->IsPressToTalkEnabled()) {
-                Application::GetInstance().StartListening();
-            }
-        });
-        boot_button_.OnPressUp([this]() {
-            if (press_to_talk_tool_ && press_to_talk_tool_->IsPressToTalkEnabled()) {
-                Application::GetInstance().StopListening();
-            }
+            app.ToggleChatState();
         });
 
-        // Key 2 (GPIO 1): Volume Up / Screen Mode (Light - Dark - Sleep)
         volume_up_button_.OnClick([this]() {
-            EnsureScreenAwake();
             auto codec = GetAudioCodec();
             auto volume = codec->output_volume() + 10;
-            if (volume > 100) {
-                volume = 100;
-            }
+            if (volume > 100) volume = 100;
             codec->SetOutputVolume(volume);
-            GetDisplay()->ShowNotification(Lang::Strings::VOLUME + std::to_string(volume));
-        });
-        volume_up_button_.OnDoubleClick([this]() {
-            CycleScreenMode();
-        });
-        volume_up_button_.OnLongPress([this]() {
-            EnsureScreenAwake();
-            GetAudioCodec()->SetOutputVolume(100);
-            GetDisplay()->ShowNotification(Lang::Strings::MAX_VOLUME);
         });
 
-        // Key 3 (GPIO 3): Volume Down / Mute / Desk Info
         volume_down_button_.OnClick([this]() {
-            EnsureScreenAwake();
             auto codec = GetAudioCodec();
             auto volume = codec->output_volume() - 10;
-            if (volume < 0) {
-                volume = 0;
-            }
+            if (volume < 0) volume = 0;
             codec->SetOutputVolume(volume);
-            GetDisplay()->ShowNotification(Lang::Strings::VOLUME + std::to_string(volume));
-        });
-        volume_down_button_.OnDoubleClick([this]() {
-            EnsureScreenAwake();
-            ShowDeskSystemInfo();
-        });
-        volume_down_button_.OnLongPress([this]() {
-            EnsureScreenAwake();
-            GetAudioCodec()->SetOutputVolume(0);
-            GetDisplay()->ShowNotification(Lang::Strings::MUTED);
         });
     }
 
-    void InitializeTools() {
-        press_to_talk_tool_ = new PressToTalkMcpTool();
-        press_to_talk_tool_->Initialize();
+    static void MicTesterTask(void* pvParameters) {
+        auto board = static_cast<Esp32C3SuperminiBoard*>(pvParameters);
+        auto codec = board->GetAudioCodec();
+        codec->SetOutputVolume(90);
+        codec->EnableInput(true);
+        codec->EnableOutput(true);
 
-        // Register buzzer control MCP tool
-        gpio_config_t io_conf = {};
-        io_conf.intr_type = GPIO_INTR_DISABLE;
-        io_conf.mode = GPIO_MODE_OUTPUT;
-        io_conf.pin_bit_mask = (1ULL << BUZZER_GPIO);
-        io_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
-        io_conf.pull_up_en = GPIO_PULLUP_DISABLE;
-        gpio_config(&io_conf);
-        gpio_set_level(BUZZER_GPIO, 0);
+        constexpr int kSamples = 128;
+        std::vector<int16_t> buffer(kSamples);
+        int log_counter = 0;
 
-        auto& mcp_server = McpServer::GetInstance();
-        mcp_server.AddTool("self.buzzer.beep",
-            "Emit a short hardware beep on the piezo buzzer",
-            PropertyList(),
-            [](const PropertyList&) -> ReturnValue {
-                gpio_set_level(BUZZER_GPIO, 1);
-                vTaskDelay(pdMS_TO_TICKS(100));
-                gpio_set_level(BUZZER_GPIO, 0);
-                return true;
-            });
+        while (1) {
+            int read_count = codec->Read(buffer.data(), kSamples);
+            if (read_count > 0) {
+                int32_t peak = 0;
+                int64_t sum_sq = 0;
+                for (int i = 0; i < read_count; i++) {
+                    int32_t abs_val = std::abs(buffer[i]);
+                    if (abs_val > peak) peak = abs_val;
+                    sum_sq += int64_t(buffer[i]) * buffer[i];
+                }
+                int32_t rms = static_cast<int32_t>(std::sqrt(sum_sq / read_count));
+
+                // Loopback audio to speaker
+                codec->Write(buffer.data(), read_count);
+
+                // Update OLED waveform
+                if (board->mic_display_) {
+                    board->mic_display_->UpdateWaveform(buffer.data(), read_count, peak, rms);
+                }
+
+                if (++log_counter >= 10) {
+                    log_counter = 0;
+                    ESP_LOGI("MicTester", "[INMP441 TEST] Peak: %ld | RMS: %ld", (long)peak, (long)rms);
+                }
+            }
+            vTaskDelay(pdMS_TO_TICKS(25));
+        }
     }
 
 public:
@@ -245,7 +261,7 @@ public:
         InitializeDisplayI2c();
         InitializeSsd1306Display();
         InitializeButtons();
-        InitializeTools();
+        xTaskCreate(MicTesterTask, "mic_tester", 3584, this, 2, nullptr);
     }
 
     virtual AudioCodec* GetAudioCodec() override {
