@@ -80,7 +80,15 @@ public:
         }
     }
 
-    void UpdateWaveform(const int16_t* samples, int count, int32_t peak, int32_t rms) {
+    void SetPlayingStatus(bool is_playing) {
+        DisplayLockGuard lock(this);
+        if (!label_status_) return;
+        if (is_playing) {
+            lv_label_set_text(label_status_, ">> PLAYING ECHO... <<");
+        }
+    }
+
+    void UpdateWaveform(const int16_t* samples, int count, int32_t peak, int32_t rms, bool is_playing = false) {
         DisplayLockGuard lock(this);
         if (!test_container_) return;
 
@@ -105,12 +113,14 @@ public:
         snprintf(buf, sizeof(buf), "Pk:%ld R:%ld", (long)peak, (long)rms);
         lv_label_set_text(label_val_, buf);
 
-        if (peak <= 50) {
+        if (is_playing) {
+            lv_label_set_text(label_status_, "PLAYING ECHO TO SPK");
+        } else if (peak <= 50) {
             lv_label_set_text(label_status_, "NO SIGNAL (Check Mic)");
         } else if (peak > 15000) {
-            lv_label_set_text(label_status_, "MIC OK: LOUD VOICE");
+            lv_label_set_text(label_status_, "MIC OK [Key1: Play]");
         } else {
-            lv_label_set_text(label_status_, "MIC OK: DETECTED");
+            lv_label_set_text(label_status_, "MIC OK [Key1: Play]");
         }
     }
 };
@@ -126,6 +136,8 @@ private:
     Button boot_button_;
     Button volume_up_button_;
     Button volume_down_button_;
+
+    std::atomic<bool> play_echo_requested_{false};
 
     void InitializeDisplayI2c() {
         i2c_master_bus_config_t bus_config = {
@@ -187,12 +199,8 @@ private:
 
     void InitializeButtons() {
         boot_button_.OnClick([this]() {
-            auto& app = Application::GetInstance();
-            if (app.GetDeviceState() == kDeviceStateStarting) {
-                EnterWifiConfigMode();
-                return;
-            }
-            app.ToggleChatState();
+            ESP_LOGI(TAG, "Key1 Clicked -> Playback Echo Triggered");
+            play_echo_requested_ = true;
         });
 
         volume_up_button_.OnClick([this]() {
@@ -200,6 +208,7 @@ private:
             auto volume = codec->output_volume() + 10;
             if (volume > 100) volume = 100;
             codec->SetOutputVolume(volume);
+            ESP_LOGI(TAG, "Volume UP: %d%%", volume);
         });
 
         volume_down_button_.OnClick([this]() {
@@ -207,6 +216,7 @@ private:
             auto volume = codec->output_volume() - 10;
             if (volume < 0) volume = 0;
             codec->SetOutputVolume(volume);
+            ESP_LOGI(TAG, "Volume DOWN: %d%%", volume);
         });
     }
 
@@ -217,36 +227,77 @@ private:
         codec->EnableInput(true);
         codec->EnableOutput(true);
 
-        constexpr int kSamples = 128;
-        std::vector<int16_t> buffer(kSamples);
+        constexpr int kChunkSamples = 128;
+        // 1.5 seconds ring buffer at 16000 Hz = 24000 samples (~48 KB)
+        constexpr size_t kRingCapacity = 24000;
+        std::vector<int16_t> ring_buffer(kRingCapacity, 0);
+        size_t write_pos = 0;
+        std::vector<int16_t> chunk(kChunkSamples);
         int log_counter = 0;
 
         while (1) {
-            int read_count = codec->Read(buffer.data(), kSamples);
+            // Check if user requested Key1 playback
+            if (board->play_echo_requested_.exchange(false)) {
+                ESP_LOGI("MicTester", "Starting Echo Playback (%d samples)...", (int)kRingCapacity);
+                if (board->mic_display_) {
+                    board->mic_display_->SetPlayingStatus(true);
+                }
+
+                // Playback ring buffer from oldest to newest
+                size_t play_read_pos = write_pos; // oldest sample is at current write_pos
+                constexpr int kPlayChunk = 256;
+                std::vector<int16_t> play_chunk(kPlayChunk);
+
+                for (size_t total_played = 0; total_played < kRingCapacity; total_played += kPlayChunk) {
+                    int32_t play_peak = 0;
+                    int64_t play_sum_sq = 0;
+                    for (int i = 0; i < kPlayChunk; i++) {
+                        int16_t val = ring_buffer[(play_read_pos + i) % kRingCapacity];
+                        play_chunk[i] = val;
+                        int32_t abs_val = std::abs(val);
+                        if (abs_val > play_peak) play_peak = abs_val;
+                        play_sum_sq += int64_t(val) * val;
+                    }
+                    play_read_pos = (play_read_pos + kPlayChunk) % kRingCapacity;
+                    int32_t play_rms = static_cast<int32_t>(std::sqrt(play_sum_sq / kPlayChunk));
+
+                    codec->Write(play_chunk.data(), kPlayChunk);
+
+                    if (board->mic_display_) {
+                        board->mic_display_->UpdateWaveform(play_chunk.data(), kPlayChunk, play_peak, play_rms, true);
+                    }
+                    vTaskDelay(pdMS_TO_TICKS(15));
+                }
+                ESP_LOGI("MicTester", "Echo Playback Finished.");
+            }
+
+            // Normal microphone recording & OLED visualizer
+            int read_count = codec->Read(chunk.data(), kChunkSamples);
             if (read_count > 0) {
                 int32_t peak = 0;
                 int64_t sum_sq = 0;
                 for (int i = 0; i < read_count; i++) {
-                    int32_t abs_val = std::abs(buffer[i]);
+                    int16_t sample = chunk[i];
+                    ring_buffer[write_pos] = sample;
+                    write_pos = (write_pos + 1) % kRingCapacity;
+
+                    int32_t abs_val = std::abs(sample);
                     if (abs_val > peak) peak = abs_val;
-                    sum_sq += int64_t(buffer[i]) * buffer[i];
+                    sum_sq += int64_t(sample) * sample;
                 }
                 int32_t rms = static_cast<int32_t>(std::sqrt(sum_sq / read_count));
 
-                // Loopback audio to speaker
-                codec->Write(buffer.data(), read_count);
-
-                // Update OLED waveform
+                // Update OLED waveform in real-time
                 if (board->mic_display_) {
-                    board->mic_display_->UpdateWaveform(buffer.data(), read_count, peak, rms);
+                    board->mic_display_->UpdateWaveform(chunk.data(), read_count, peak, rms, false);
                 }
 
                 if (++log_counter >= 10) {
                     log_counter = 0;
-                    ESP_LOGI("MicTester", "[INMP441 TEST] Peak: %ld | RMS: %ld", (long)peak, (long)rms);
+                    ESP_LOGI("MicTester", "[INMP441 REC] Peak: %ld | RMS: %ld", (long)peak, (long)rms);
                 }
             }
-            vTaskDelay(pdMS_TO_TICKS(25));
+            vTaskDelay(pdMS_TO_TICKS(20));
         }
     }
 
@@ -258,7 +309,7 @@ public:
         InitializeDisplayI2c();
         InitializeSsd1306Display();
         InitializeButtons();
-        xTaskCreate(MicTesterTask, "mic_tester", 3584, this, 2, nullptr);
+        xTaskCreate(MicTesterTask, "mic_tester", 4096, this, 2, nullptr);
     }
 
     virtual AudioCodec* GetAudioCodec() override {
@@ -273,3 +324,4 @@ public:
 };
 
 DECLARE_BOARD(Esp32C3SuperminiBoard);
+
