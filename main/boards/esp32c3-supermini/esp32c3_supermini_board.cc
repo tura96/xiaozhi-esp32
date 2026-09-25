@@ -15,6 +15,7 @@
 #include <esp_lcd_panel_ops.h>
 #include <esp_lcd_panel_vendor.h>
 #include <esp_system.h>
+#include <atomic>
 #include <cmath>
 #include <vector>
 #include <cstdlib>
@@ -65,18 +66,17 @@ public:
         lv_obj_set_pos(label_status_, 2, 28);
         lv_label_set_text(label_status_, "WAITING SIGNAL...");
 
-        // 16 Vertical Wave Bars (X: 0 to 127, Y: 42 to 62)
+        // 16 Vertical Wave Bars using basic lv_obj_create (X: 0 to 127, base Y: 62)
         for (int i = 0; i < 16; i++) {
-            bars_[i] = lv_bar_create(test_container_);
-            lv_obj_set_pos(bars_[i], i * 8, 42);
-            lv_obj_set_size(bars_[i], 6, 20);
-            lv_bar_set_range(bars_[i], 0, 100);
-            lv_bar_set_value(bars_[i], 0, LV_ANIM_OFF);
+            bars_[i] = lv_obj_create(test_container_);
+            lv_obj_set_pos(bars_[i], i * 8, 61);
+            lv_obj_set_size(bars_[i], 6, 2);
+            lv_obj_set_style_pad_all(bars_[i], 0, 0);
             lv_obj_set_style_radius(bars_[i], 0, 0);
-            lv_obj_set_style_radius(bars_[i], 0, LV_PART_INDICATOR);
             lv_obj_set_style_border_width(bars_[i], 0, 0);
-            lv_obj_set_style_bg_color(bars_[i], lv_color_black(), 0);
-            lv_obj_set_style_bg_color(bars_[i], lv_color_white(), LV_PART_INDICATOR);
+            lv_obj_set_style_bg_color(bars_[i], lv_color_white(), 0);
+            lv_obj_set_style_bg_opa(bars_[i], LV_OPA_COVER, 0);
+            lv_obj_remove_flag(bars_[i], LV_OBJ_FLAG_SCROLLABLE);
         }
     }
 
@@ -103,9 +103,11 @@ public:
                     if (v > sub_peak) sub_peak = v;
                 }
             }
-            int pct = (sub_peak * 100) / 32768;
-            if (pct > 100) pct = 100;
-            lv_bar_set_value(bars_[i], pct, LV_ANIM_OFF);
+            int h = (sub_peak * 22) / 32768;
+            if (h < 1) h = 1;
+            if (h > 22) h = 22;
+            lv_obj_set_pos(bars_[i], i * 8, 63 - h);
+            lv_obj_set_size(bars_[i], 6, h);
         }
 
         // Update Labels
