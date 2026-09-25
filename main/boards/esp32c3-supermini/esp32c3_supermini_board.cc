@@ -15,9 +15,7 @@
 #include <esp_lcd_panel_ops.h>
 #include <esp_lcd_panel_vendor.h>
 #include <esp_system.h>
-#include <cmath>
-#include <vector>
-#include <cstdlib>
+#include <ctime>
 
 #define TAG "Esp32C3SuperminiBoard"
 
@@ -28,11 +26,17 @@ private:
     esp_lcd_panel_handle_t panel_ = nullptr;
     Display* display_ = nullptr;
 
+    enum ScreenMode {
+        kScreenDark = 0,
+        kScreenLight = 1,
+        kScreenSleep = 2
+    };
+    ScreenMode screen_mode_ = kScreenDark;
+
     Button boot_button_;
     Button volume_up_button_;
     Button volume_down_button_;
-
-    volatile bool play_echo_requested_ = false;
+    PressToTalkMcpTool* press_to_talk_tool_ = nullptr;
 
     void InitializeDisplayI2c() {
         i2c_master_bus_config_t bus_config = {
@@ -91,116 +95,146 @@ private:
         display_ = new OledDisplay(panel_io_, panel_, DISPLAY_WIDTH, DISPLAY_HEIGHT, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y);
     }
 
+    void CycleScreenMode() {
+        if (!panel_) return;
+        if (screen_mode_ == kScreenDark) {
+            screen_mode_ = kScreenLight;
+            esp_lcd_panel_disp_on_off(panel_, true);
+            esp_lcd_panel_invert_color(panel_, true);
+            GetDisplay()->ShowNotification("Light Mode", 2000);
+        } else if (screen_mode_ == kScreenLight) {
+            screen_mode_ = kScreenSleep;
+            esp_lcd_panel_disp_on_off(panel_, false);
+        } else {
+            screen_mode_ = kScreenDark;
+            esp_lcd_panel_disp_on_off(panel_, true);
+            esp_lcd_panel_invert_color(panel_, false);
+            GetDisplay()->ShowNotification("Dark Mode", 2000);
+        }
+    }
+
+    void EnsureScreenAwake() {
+        if (screen_mode_ == kScreenSleep && panel_) {
+            screen_mode_ = kScreenDark;
+            esp_lcd_panel_disp_on_off(panel_, true);
+            esp_lcd_panel_invert_color(panel_, false);
+        }
+    }
+
+    void ShowDeskSystemInfo() {
+        auto& wifi = WifiManager::GetInstance();
+        time_t now = time(nullptr);
+        struct tm tm_info;
+        localtime_r(&now, &tm_info);
+
+        char time_str[16];
+        if (tm_info.tm_year > 120) {
+            snprintf(time_str, sizeof(time_str), "%02d:%02d:%02d",
+                     tm_info.tm_hour, tm_info.tm_min, tm_info.tm_sec);
+        } else {
+            snprintf(time_str, sizeof(time_str), "Ready");
+        }
+
+        char info_str[48];
+        snprintf(info_str, sizeof(info_str), "IP: %s\nRAM: %luKB",
+                 wifi.GetIpAddress().empty() ? "Offline" : wifi.GetIpAddress().c_str(),
+                 (unsigned long)(esp_get_free_heap_size() / 1024));
+
+        GetDisplay()->SetStatus(time_str);
+        GetDisplay()->SetChatMessage("system", info_str);
+    }
+
     void InitializeButtons() {
+        // Key 1 (GPIO 0): PTT / Toggle Chat / Wi-Fi Config
         boot_button_.OnClick([this]() {
-            ESP_LOGI(TAG, "Key1 Clicked -> Playback Echo Triggered");
-            play_echo_requested_ = true;
+            EnsureScreenAwake();
+            auto& app = Application::GetInstance();
+            if (app.GetDeviceState() == kDeviceStateStarting) {
+                EnterWifiConfigMode();
+                return;
+            }
+            if (!press_to_talk_tool_ || !press_to_talk_tool_->IsPressToTalkEnabled()) {
+                app.ToggleChatState();
+            }
+        });
+        boot_button_.OnPressDown([this]() {
+            EnsureScreenAwake();
+            if (press_to_talk_tool_ && press_to_talk_tool_->IsPressToTalkEnabled()) {
+                Application::GetInstance().StartListening();
+            }
+        });
+        boot_button_.OnPressUp([this]() {
+            if (press_to_talk_tool_ && press_to_talk_tool_->IsPressToTalkEnabled()) {
+                Application::GetInstance().StopListening();
+            }
         });
 
+        // Key 2 (GPIO 1): Volume Up / Screen Mode (Light - Dark - Sleep)
         volume_up_button_.OnClick([this]() {
+            EnsureScreenAwake();
             auto codec = GetAudioCodec();
             auto volume = codec->output_volume() + 10;
-            if (volume > 100) volume = 100;
+            if (volume > 100) {
+                volume = 100;
+            }
             codec->SetOutputVolume(volume);
-            ESP_LOGI(TAG, "Volume UP: %d%%", volume);
+            GetDisplay()->ShowNotification(Lang::Strings::VOLUME + std::to_string(volume));
+        });
+        volume_up_button_.OnDoubleClick([this]() {
+            CycleScreenMode();
+        });
+        volume_up_button_.OnLongPress([this]() {
+            EnsureScreenAwake();
+            GetAudioCodec()->SetOutputVolume(100);
+            GetDisplay()->ShowNotification(Lang::Strings::MAX_VOLUME);
         });
 
+        // Key 3 (GPIO 3): Volume Down / Mute / Desk Info
         volume_down_button_.OnClick([this]() {
+            EnsureScreenAwake();
             auto codec = GetAudioCodec();
             auto volume = codec->output_volume() - 10;
-            if (volume < 0) volume = 0;
+            if (volume < 0) {
+                volume = 0;
+            }
             codec->SetOutputVolume(volume);
-            ESP_LOGI(TAG, "Volume DOWN: %d%%", volume);
+            GetDisplay()->ShowNotification(Lang::Strings::VOLUME + std::to_string(volume));
+        });
+        volume_down_button_.OnDoubleClick([this]() {
+            EnsureScreenAwake();
+            ShowDeskSystemInfo();
+        });
+        volume_down_button_.OnLongPress([this]() {
+            EnsureScreenAwake();
+            GetAudioCodec()->SetOutputVolume(0);
+            GetDisplay()->ShowNotification(Lang::Strings::MUTED);
         });
     }
 
-    static void MicTesterTask(void* pvParameters) {
-        auto board = static_cast<Esp32C3SuperminiBoard*>(pvParameters);
-        auto codec = board->GetAudioCodec();
-        codec->SetOutputVolume(90);
-        codec->EnableInput(true);
-        codec->EnableOutput(true);
+    void InitializeTools() {
+        press_to_talk_tool_ = new PressToTalkMcpTool();
+        press_to_talk_tool_->Initialize();
 
-        constexpr int kChunkSamples = 128;
-        // 1.5 seconds ring buffer at 16000 Hz = 24000 samples (~48 KB)
-        constexpr size_t kRingCapacity = 24000;
-        std::vector<int16_t> ring_buffer(kRingCapacity, 0);
-        size_t write_pos = 0;
-        std::vector<int16_t> chunk(kChunkSamples);
-        int log_counter = 0;
-        int display_update_counter = 0;
+        // Register buzzer control MCP tool
+        gpio_config_t io_conf = {};
+        io_conf.intr_type = GPIO_INTR_DISABLE;
+        io_conf.mode = GPIO_MODE_OUTPUT;
+        io_conf.pin_bit_mask = (1ULL << BUZZER_GPIO);
+        io_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
+        io_conf.pull_up_en = GPIO_PULLUP_DISABLE;
+        gpio_config(&io_conf);
+        gpio_set_level(BUZZER_GPIO, 0);
 
-        vTaskDelay(pdMS_TO_TICKS(1000)); // Wait for display to initialize
-
-        while (1) {
-            // Check if user requested Key1 playback
-            if (board->play_echo_requested_) {
-                board->play_echo_requested_ = false;
-                ESP_LOGI("MicTester", "Starting Echo Playback (%d samples)...", (int)kRingCapacity);
-                if (board->display_) {
-                    board->display_->SetStatus("PLAYING ECHO...");
-                    board->display_->SetChatMessage("system", "Playing to speaker...\nListen closely");
-                }
-
-                // Playback ring buffer from oldest to newest
-                size_t play_read_pos = write_pos; // oldest sample is at current write_pos
-                constexpr int kPlayChunk = 256;
-                std::vector<int16_t> play_chunk(kPlayChunk);
-
-                for (size_t total_played = 0; total_played < kRingCapacity; total_played += kPlayChunk) {
-                    for (int i = 0; i < kPlayChunk; i++) {
-                        play_chunk[i] = ring_buffer[(play_read_pos + i) % kRingCapacity];
-                    }
-                    play_read_pos = (play_read_pos + kPlayChunk) % kRingCapacity;
-
-                    codec->Write(play_chunk.data(), kPlayChunk);
-                    vTaskDelay(pdMS_TO_TICKS(15));
-                }
-                ESP_LOGI("MicTester", "Echo Playback Finished.");
-                if (board->display_) {
-                    board->display_->SetStatus("ECHO FINISHED");
-                }
-            }
-
-            // Normal microphone recording
-            int read_count = codec->Read(chunk.data(), kChunkSamples);
-            if (read_count > 0) {
-                int32_t peak = 0;
-                int64_t sum_sq = 0;
-                for (int i = 0; i < read_count; i++) {
-                    int16_t sample = chunk[i];
-                    ring_buffer[write_pos] = sample;
-                    write_pos = (write_pos + 1) % kRingCapacity;
-
-                    int32_t abs_val = std::abs(sample);
-                    if (abs_val > peak) peak = abs_val;
-                    sum_sq += int64_t(sample) * sample;
-                }
-                int32_t rms = static_cast<int32_t>(std::sqrt(sum_sq / read_count));
-
-                // Update Display every ~200ms
-                if (++display_update_counter >= 10) {
-                    display_update_counter = 0;
-                    if (board->display_) {
-                        char msg_buf[64];
-                        if (peak <= 50) {
-                            board->display_->SetStatus("NO MIC SIGNAL");
-                            snprintf(msg_buf, sizeof(msg_buf), "Pk:%ld R:%ld\nCheck Mic Soldering", (long)peak, (long)rms);
-                        } else {
-                            board->display_->SetStatus("MIC DETECTED!");
-                            snprintf(msg_buf, sizeof(msg_buf), "Pk:%ld R:%ld\n[Key1: Replay Echo]", (long)peak, (long)rms);
-                        }
-                        board->display_->SetChatMessage("mic", msg_buf);
-                    }
-                }
-
-                if (++log_counter >= 10) {
-                    log_counter = 0;
-                    ESP_LOGI("MicTester", "[INMP441 REC] Peak: %ld | RMS: %ld", (long)peak, (long)rms);
-                }
-            }
-            vTaskDelay(pdMS_TO_TICKS(20));
-        }
+        auto& mcp_server = McpServer::GetInstance();
+        mcp_server.AddTool("self.buzzer.beep",
+            "Emit a short hardware beep on the piezo buzzer",
+            PropertyList(),
+            [](const PropertyList&) -> ReturnValue {
+                gpio_set_level(BUZZER_GPIO, 1);
+                vTaskDelay(pdMS_TO_TICKS(100));
+                gpio_set_level(BUZZER_GPIO, 0);
+                return true;
+            });
     }
 
 public:
@@ -211,7 +245,7 @@ public:
         InitializeDisplayI2c();
         InitializeSsd1306Display();
         InitializeButtons();
-        xTaskCreate(MicTesterTask, "mic_tester", 4096, this, 2, nullptr);
+        InitializeTools();
     }
 
     virtual AudioCodec* GetAudioCodec() override {
