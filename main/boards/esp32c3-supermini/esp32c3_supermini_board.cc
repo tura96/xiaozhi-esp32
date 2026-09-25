@@ -26,9 +26,8 @@ private:
     lv_obj_t* test_container_ = nullptr;
     lv_obj_t* label_title_ = nullptr;
     lv_obj_t* label_val_ = nullptr;
-    lv_obj_t* wave_line_ = nullptr;
-    lv_obj_t* vu_bar_ = nullptr;
-    lv_point_precise_t points_[64];
+    lv_obj_t* label_status_ = nullptr;
+    lv_obj_t* bars_[16];
 
 public:
     SuperminiMicTesterDisplay(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_handle_t panel,
@@ -61,60 +60,58 @@ public:
         lv_obj_set_pos(label_val_, 2, 14);
         lv_label_set_text(label_val_, "Peak: 0 | RMS: 0");
 
-        // Waveform Line (64 points across 128px)
-        for (int i = 0; i < 64; i++) {
-            points_[i].x = i * 2;
-            points_[i].y = 40;
-        }
-        wave_line_ = lv_line_create(test_container_);
-        lv_line_set_points(wave_line_, points_, 64);
-        lv_obj_set_style_line_width(wave_line_, 1, 0);
-        lv_obj_set_style_line_color(wave_line_, lv_color_white(), 0);
+        // Status string
+        label_status_ = lv_label_create(test_container_);
+        lv_obj_set_pos(label_status_, 2, 28);
+        lv_label_set_text(label_status_, "WAITING SIGNAL...");
 
-        // VU meter bar at bottom
-        vu_bar_ = lv_bar_create(test_container_);
-        lv_obj_set_pos(vu_bar_, 0, 58);
-        lv_obj_set_size(vu_bar_, 128, 6);
-        lv_bar_set_range(vu_bar_, 0, 100);
-        lv_bar_set_value(vu_bar_, 0, LV_ANIM_OFF);
-        lv_obj_set_style_radius(vu_bar_, 0, 0);
-        lv_obj_set_style_radius(vu_bar_, 0, LV_PART_INDICATOR);
-        lv_obj_set_style_border_width(vu_bar_, 0, 0);
-        lv_obj_set_style_bg_color(vu_bar_, lv_color_black(), 0);
-        lv_obj_set_style_bg_color(vu_bar_, lv_color_white(), LV_PART_INDICATOR);
+        // 16 Vertical Wave Bars (X: 0 to 127, Y: 42 to 62)
+        for (int i = 0; i < 16; i++) {
+            bars_[i] = lv_bar_create(test_container_);
+            lv_obj_set_pos(bars_[i], i * 8, 42);
+            lv_obj_set_size(bars_[i], 6, 20);
+            lv_bar_set_range(bars_[i], 0, 100);
+            lv_bar_set_value(bars_[i], 0, LV_ANIM_OFF);
+            lv_obj_set_style_radius(bars_[i], 0, 0);
+            lv_obj_set_style_radius(bars_[i], 0, LV_PART_INDICATOR);
+            lv_obj_set_style_border_width(bars_[i], 0, 0);
+            lv_obj_set_style_bg_color(bars_[i], lv_color_black(), 0);
+            lv_obj_set_style_bg_color(bars_[i], lv_color_white(), LV_PART_INDICATOR);
+        }
     }
 
     void UpdateWaveform(const int16_t* samples, int count, int32_t peak, int32_t rms) {
         DisplayLockGuard lock(this);
         if (!test_container_) return;
 
-        // Downsample to 64 points
-        int step = (count >= 64) ? (count / 64) : 1;
-        for (int i = 0; i < 64; i++) {
-            int idx = i * step;
-            if (idx >= count) idx = count - 1;
-            int16_t s = samples[idx];
-            // Center is Y = 40, range +/- 16px
-            int y = 40 - (s * 16 / 32768);
-            if (y < 24) y = 24;
-            if (y > 56) y = 56;
-            points_[i].y = y;
+        // Update 16 bars with amplitude of 16 subdivisions
+        int chunk_size = (count >= 16) ? (count / 16) : 1;
+        for (int i = 0; i < 16; i++) {
+            int32_t sub_peak = 0;
+            for (int j = 0; j < chunk_size; j++) {
+                int idx = i * chunk_size + j;
+                if (idx < count) {
+                    int32_t v = std::abs(samples[idx]);
+                    if (v > sub_peak) sub_peak = v;
+                }
+            }
+            int pct = (sub_peak * 100) / 32768;
+            if (pct > 100) pct = 100;
+            lv_bar_set_value(bars_[i], pct, LV_ANIM_OFF);
         }
-        lv_line_set_points(wave_line_, points_, 64);
 
         // Update Labels
         char buf[32];
-        if (peak == 0) {
-            snprintf(buf, sizeof(buf), "NO SIGNAL (0)");
-        } else {
-            snprintf(buf, sizeof(buf), "Pk:%ld R:%ld", (long)peak, (long)rms);
-        }
+        snprintf(buf, sizeof(buf), "Pk:%ld R:%ld", (long)peak, (long)rms);
         lv_label_set_text(label_val_, buf);
 
-        // Update VU Bar (0 - 100%)
-        int pct = (peak * 100) / 32768;
-        if (pct > 100) pct = 100;
-        lv_bar_set_value(vu_bar_, pct, LV_ANIM_OFF);
+        if (peak <= 50) {
+            lv_label_set_text(label_status_, "NO SIGNAL (Check Mic)");
+        } else if (peak > 15000) {
+            lv_label_set_text(label_status_, "MIC OK: LOUD VOICE");
+        } else {
+            lv_label_set_text(label_status_, "MIC OK: DETECTED");
+        }
     }
 };
 
