@@ -15,7 +15,6 @@
 #include <esp_lcd_panel_ops.h>
 #include <esp_lcd_panel_vendor.h>
 #include <esp_system.h>
-#include <atomic>
 #include <cmath>
 #include <vector>
 #include <cstdlib>
@@ -33,7 +32,7 @@ private:
     Button volume_up_button_;
     Button volume_down_button_;
 
-    std::atomic<bool> play_echo_requested_{false};
+    volatile bool play_echo_requested_ = false;
 
     void InitializeDisplayI2c() {
         i2c_master_bus_config_t bus_config = {
@@ -135,7 +134,8 @@ private:
 
         while (1) {
             // Check if user requested Key1 playback
-            if (board->play_echo_requested_.exchange(false)) {
+            if (board->play_echo_requested_) {
+                board->play_echo_requested_ = false;
                 ESP_LOGI("MicTester", "Starting Echo Playback (%d samples)...", (int)kRingCapacity);
                 if (board->display_) {
                     board->display_->SetStatus("PLAYING ECHO...");
