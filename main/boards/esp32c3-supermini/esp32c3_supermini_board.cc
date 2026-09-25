@@ -19,31 +19,6 @@
 
 #define TAG "Esp32C3SuperminiBoard"
 
-class SuperminiAudioCodec : public NoAudioCodecDuplex {
-public:
-    SuperminiAudioCodec(int input_sample_rate, int output_sample_rate,
-                        gpio_num_t bclk, gpio_num_t ws, gpio_num_t dout, gpio_num_t din)
-        : NoAudioCodecDuplex(input_sample_rate, output_sample_rate, bclk, ws, dout, din) {
-        input_gain_ = 4.0f; // 4x digital gain (+12dB boost)
-    }
-
-    virtual int Read(int16_t* dest, int samples) override {
-        int read_samples = NoAudioCodecDuplex::Read(dest, samples);
-        if (read_samples > 0) {
-            for (int i = 0; i < read_samples; i++) {
-                int32_t val = static_cast<int32_t>(dest[i]) * 4;
-                if (val > INT16_MAX) {
-                    val = INT16_MAX;
-                } else if (val < -INT16_MAX) {
-                    val = -INT16_MAX;
-                }
-                dest[i] = static_cast<int16_t>(val);
-            }
-        }
-        return read_samples;
-    }
-};
-
 class Esp32C3SuperminiBoard : public WifiBoard {
 private:
     i2c_master_bus_handle_t display_i2c_bus_ = nullptr;
@@ -274,7 +249,7 @@ public:
     }
 
     virtual AudioCodec* GetAudioCodec() override {
-        static SuperminiAudioCodec audio_codec(AUDIO_INPUT_SAMPLE_RATE, AUDIO_OUTPUT_SAMPLE_RATE,
+        static NoAudioCodecDuplex audio_codec(AUDIO_INPUT_SAMPLE_RATE, AUDIO_OUTPUT_SAMPLE_RATE,
             AUDIO_I2S_GPIO_BCLK, AUDIO_I2S_GPIO_WS, AUDIO_I2S_GPIO_DOUT, AUDIO_I2S_GPIO_DIN);
         return &audio_codec;
     }
