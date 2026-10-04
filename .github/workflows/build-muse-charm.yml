@@ -1,0 +1,67 @@
+name: Build Muse Charm ESP32-C3
+
+on:
+  push:
+    branches:
+      - main
+      - custom-board
+      - esp32c3-supermini
+      - muse-charm
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build Muse Gadget ESP32-C3 SuperMini
+    runs-on: ubuntu-latest
+    container:
+      image: espressif/idf:v6.0.1
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Clone Meta Muse Gadget SDK
+        run: |
+          git clone --depth 1 https://github.com/facebookincubator/muse-gadget-sdk.git /tmp/muse-gadget-sdk
+
+      - name: Inject ESP32-C3 SuperMini Overlay & Partitions
+        run: |
+          cp muse-gadget-sdk/esp32/partitions_4mb.csv /tmp/muse-gadget-sdk/esp32/partitions_4mb.csv
+          cp muse-gadget-sdk/esp32/devices/sdkconfig.esp32c3-supermini /tmp/muse-gadget-sdk/esp32/devices/sdkconfig.esp32c3-supermini
+
+      - name: Build Firmware
+        shell: bash
+        working-directory: /tmp/muse-gadget-sdk/esp32
+        run: |
+          . "$IDF_PATH/export.sh"
+          idf.py -B build -DIDF_TARGET=esp32c3 -DSDKCONFIG=build/sdkconfig \
+            -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;devices/sdkconfig.esp32c3-supermini" build
+          
+          # Merge binary for 1-click flashing at 0x0
+          cd build
+          esptool.py --chip esp32c3 merge_bin -o merged-muse-charm.bin --flash_mode dio --flash_freq 80m --flash_size 4MB \
+            0x0 bootloader/bootloader.bin \
+            0x10000 partition_table/partition-table.bin \
+            0x20000 muse-gadget.bin
+          
+          mkdir -p $GITHUB_WORKSPACE/build/muse-charm
+          cp merged-muse-charm.bin $GITHUB_WORKSPACE/build/muse-charm/
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: muse_charm_esp32c3_bin
+          path: build/muse-charm/merged-muse-charm.bin
+          if-no-files-found: error
+
+      - name: Release binary
+        uses: softprops/action-gh-release@v2
+        continue-on-error: true
+        with:
+          tag_name: v-muse-charm
+          name: "Meta Muse Charm (ESP32-C3 SuperMini)"
+          files: build/muse-charm/merged-muse-charm.bin
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
