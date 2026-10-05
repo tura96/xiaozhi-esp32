@@ -242,18 +242,12 @@ menu "ESP32 Device SDK"
             commands.
 
     config HOMEHUB_VOICE
-        bool "Push-to-talk voice chat (Home Assistant Voice PE)"
-        depends on HOMEHUB_LED_BACKEND_VOICE_RING && SPIRAM
+        bool "Push-to-talk voice chat"
         default y
         help
-            Hold the centre button, speak, release: the audio goes to the
+            Hold the button, speak, release: the audio goes to the
             agent's chat as a voice note, which the VM transcribes, and the
-            reply appears in the Muse app as text. To speak it, plug a TTS
-            API of your own into start_tts in muse_chat_session.cpp. This
-            uses a second Noise session (Muse's voice session) with Link's
-            account. While the mute
-            switch is on, the button keeps its setup role (tap to confirm
-            pairing, hold to reset).
+            reply plays through the speaker and appears on the OLED display.
 
     config HOMEHUB_SENSECAP_SENSORS
         bool "SenseCAP Indicator air sensors (sensors.read)"
