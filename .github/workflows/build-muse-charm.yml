@@ -30,6 +30,7 @@ jobs:
         run: |
           cp muse-gadget-sdk/esp32/partitions_4mb.csv /tmp/muse-gadget-sdk/esp32/partitions_4mb.csv
           cp muse-gadget-sdk/esp32/devices/sdkconfig.esp32c3-supermini /tmp/muse-gadget-sdk/esp32/devices/sdkconfig.esp32c3-supermini
+          cp -r muse-gadget-sdk/esp32/main/* /tmp/muse-gadget-sdk/esp32/main/
 
       - name: Build Firmware
         shell: bash
