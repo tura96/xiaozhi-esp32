@@ -477,28 +477,16 @@ static void ssd1306_task(void *arg) {
 
 // ---- led_status.h Interface Implementation ---------------------------------
 
-bool led_status_init(void) {
-    s_mutex = xSemaphoreCreateMutex();
-    if (!s_mutex) return false;
-
-    int sda = 8;
-    int scl = 9;
-#ifdef CONFIG_HOMEHUB_SSD1306_SDA_GPIO
-    sda = CONFIG_HOMEHUB_SSD1306_SDA_GPIO;
-#endif
-#ifdef CONFIG_HOMEHUB_SSD1306_SCL_GPIO
-    scl = CONFIG_HOMEHUB_SSD1306_SCL_GPIO;
-#endif
-
-    ESP_LOGI(TAG, "Initializing SSD1306 OLED (SDA=%d, SCL=%d)...", sda, scl);
-
+static bool probe_pins_and_addr(int sda, int scl, uint16_t *out_addr, i2c_master_bus_handle_t *out_bus, i2c_master_dev_handle_t *out_dev) {
     gpio_reset_pin((gpio_num_t)sda);
     gpio_reset_pin((gpio_num_t)scl);
+    gpio_set_direction((gpio_num_t)sda, GPIO_MODE_INPUT_OUTPUT_OD);
+    gpio_set_direction((gpio_num_t)scl, GPIO_MODE_INPUT_OUTPUT_OD);
     gpio_set_pull_mode((gpio_num_t)sda, GPIO_PULLUP_ONLY);
     gpio_set_pull_mode((gpio_num_t)scl, GPIO_PULLUP_ONLY);
 
     i2c_master_bus_config_t bus_config = {
-        .i2c_port = I2C_NUM_0,
+        .i2c_port = -1,
         .sda_io_num = (gpio_num_t)sda,
         .scl_io_num = (gpio_num_t)scl,
         .clk_source = I2C_CLK_SRC_DEFAULT,
@@ -507,43 +495,70 @@ bool led_status_init(void) {
             .enable_internal_pullup = true,
         },
     };
-    esp_err_t err = i2c_new_master_bus(&bus_config, &s_i2c_bus);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "i2c_new_master_bus failed: %s", esp_err_to_name(err));
+    i2c_master_bus_handle_t bus = NULL;
+    if (i2c_new_master_bus(&bus_config, &bus) != ESP_OK) {
         return false;
     }
 
-    s_dev_addr = 0x3C;
-    if (i2c_master_probe(s_i2c_bus, 0x3C, 100) == ESP_OK) {
-        s_dev_addr = 0x3C;
-        ESP_LOGI(TAG, "Found SSD1306 at I2C address 0x3C");
-    } else if (i2c_master_probe(s_i2c_bus, 0x3D, 100) == ESP_OK) {
-        s_dev_addr = 0x3D;
-        ESP_LOGI(TAG, "Found SSD1306 at I2C address 0x3D");
-    } else {
-        ESP_LOGW(TAG, "I2C probe returned no ACK at 0x3C/0x3D, defaulting to 0x3C");
-        s_dev_addr = 0x3C;
+    uint16_t addrs[] = {0x3C, 0x3D};
+    for (int i = 0; i < 2; i++) {
+        if (i2c_master_probe(bus, addrs[i], 50) == ESP_OK) {
+            i2c_device_config_t dev_cfg = {
+                .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+                .device_address = addrs[i],
+                .scl_speed_hz = 400000,
+            };
+            i2c_master_dev_handle_t dev = NULL;
+            if (i2c_master_bus_add_device(bus, &dev_cfg, &dev) == ESP_OK) {
+                *out_addr = addrs[i];
+                *out_bus = bus;
+                *out_dev = dev;
+                ESP_LOGI(TAG, "SUCCESS: Found OLED at 0x%02X on SDA=%d, SCL=%d", addrs[i], sda, scl);
+                return true;
+            }
+        }
     }
+    i2c_del_master_bus(bus);
+    return false;
+}
 
-    i2c_device_config_t dev_cfg = {
-        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
-        .device_address = s_dev_addr,
-        .scl_speed_hz = 400000,
+bool led_status_init(void) {
+    s_mutex = xSemaphoreCreateMutex();
+    if (!s_mutex) return false;
+
+    static const struct { int sda; int scl; } pairs[] = {
+        {8, 9},   // Standard SuperMini OLED
+        {9, 8},   // Inverted SDA/SCL
+        {4, 5},   // Alt pair
+        {5, 4},   // Alt pair
+        {6, 7},   // I2S pins (in case shared)
+        {10, 8},  // Alt
+        {1, 0},   // Alt
+        {0, 1}    // Alt
     };
-    err = i2c_master_bus_add_device(s_i2c_bus, &dev_cfg, &s_i2c_dev);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "i2c_master_bus_add_device failed: %s", esp_err_to_name(err));
-        return false;
+
+    bool found = false;
+    for (size_t i = 0; i < sizeof(pairs) / sizeof(pairs[0]); i++) {
+        ESP_LOGI(TAG, "Probing I2C SDA=%d, SCL=%d...", pairs[i].sda, pairs[i].scl);
+        if (probe_pins_and_addr(pairs[i].sda, pairs[i].scl, &s_dev_addr, &s_i2c_bus, &s_i2c_dev)) {
+            found = true;
+            break;
+        }
     }
 
-    // Initialize hardware and clear screen
+    if (!found) {
+        ESP_LOGW(TAG, "No I2C device ACKed on any pin pair! Defaulting to SDA=8, SCL=9 (0x3C)");
+        (void)probe_pins_and_addr(8, 9, &s_dev_addr, &s_i2c_bus, &s_i2c_dev);
+    }
+
+    // Initialize SSD1306 hardware
     ssd1306_hw_init();
     fb_clear();
     fb_draw_string_centered(26, "MUSE CHARM", true, 2);
     ssd1306_flush(s_fb);
 
     xTaskCreate(ssd1306_task, "ssd1306_task", 3072, NULL, 2, NULL);
-    ESP_LOGI(TAG, "SSD1306 OLED ready: 128x64 direct I2C");
+    ESP_LOGI(TAG, "SSD1306 OLED initialized");
     return true;
 }
 
