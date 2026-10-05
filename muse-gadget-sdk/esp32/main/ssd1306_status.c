@@ -51,7 +51,67 @@ static float s_level = 0.0f;
 static int s_volume = 0;
 static int64_t s_volume_until = 0;
 
+// Smart Action Trigger & Card Reader State
+#define CARD_MAX_LINES 16
+#define CARD_CHARS_PER_LINE 21
+#define POMODORO_DEFAULT_DURATION_SEC (25 * 60)
+
+static bool s_card_active = false;
+static char s_card_title[32] = {0};
+static char s_card_lines[CARD_MAX_LINES][CARD_CHARS_PER_LINE + 1] = {{0}};
+static int s_card_line_count = 0;
+static int s_card_scroll_line = 0;
+
+static bool s_pomodoro_active = false;
+static bool s_pomodoro_paused = false;
+static int64_t s_pomodoro_start_us = 0;
+static int64_t s_pomodoro_paused_at_us = 0;
+static int s_pomodoro_duration_sec = POMODORO_DEFAULT_DURATION_SEC;
+
+static char s_action_badge[32] = {0};
+static int64_t s_action_until_us = 0;
+
 static uint8_t s_fb[OLED_FB_SIZE];
+
+static void split_text_into_lines(const char *text) {
+    s_card_line_count = 0;
+    s_card_scroll_line = 0;
+    if (!text || !text[0]) return;
+
+    const char *p = text;
+    while (*p && s_card_line_count < CARD_MAX_LINES) {
+        if (*p == '\n') {
+            s_card_lines[s_card_line_count][0] = '\0';
+            s_card_line_count++;
+            p++;
+            continue;
+        }
+
+        int len = 0;
+        int last_space = -1;
+        while (p[len] && p[len] != '\n' && len < CARD_CHARS_PER_LINE) {
+            if (p[len] == ' ') {
+                last_space = len;
+            }
+            len++;
+        }
+
+        if (p[len] == '\0' || p[len] == '\n') {
+            memcpy(s_card_lines[s_card_line_count], p, len);
+            s_card_lines[s_card_line_count][len] = '\0';
+            s_card_line_count++;
+            p += len;
+            if (*p == '\n') p++;
+        } else {
+            int break_len = (last_space > 0) ? last_space : CARD_CHARS_PER_LINE;
+            memcpy(s_card_lines[s_card_line_count], p, break_len);
+            s_card_lines[s_card_line_count][break_len] = '\0';
+            s_card_line_count++;
+            p += break_len;
+            if (*p == ' ') p++;
+        }
+    }
+}
 
 // ---- Direct SSD1306 I2C Driver ---------------------------------------------
 
@@ -320,6 +380,26 @@ static void render_screen_frame(int frame) {
     char title_buf[48];
     strncpy(title_buf, s_title[0] ? s_title : "MUSE CHARM", sizeof(title_buf) - 1);
     title_buf[sizeof(title_buf) - 1] = '\0';
+
+    bool card_active = s_card_active;
+    char card_title[32];
+    strncpy(card_title, s_card_title, sizeof(card_title) - 1);
+    card_title[sizeof(card_title) - 1] = '\0';
+    int card_line_count = s_card_line_count;
+    int card_scroll_line = s_card_scroll_line;
+
+    bool pomo_active = s_pomodoro_active;
+    bool pomo_paused = s_pomodoro_paused;
+    int64_t pomo_start_us = s_pomodoro_start_us;
+    int64_t pomo_paused_at_us = s_pomodoro_paused_at_us;
+    int pomo_duration = s_pomodoro_duration_sec;
+
+    char action_badge[32];
+    bool show_action = (esp_timer_get_time() < s_action_until_us) && (s_action_badge[0] != '\0');
+    if (show_action) {
+        strncpy(action_badge, s_action_badge, sizeof(action_badge) - 1);
+        action_badge[sizeof(action_badge) - 1] = '\0';
+    }
     xSemaphoreGive(s_mutex);
 
     if (show_volume) {
@@ -377,6 +457,81 @@ static void render_screen_frame(int frame) {
         return;
     }
 
+    if (card_active) {
+        char tag_str[16];
+        if (card_line_count > 4) {
+            snprintf(tag_str, sizeof(tag_str), "%d/%d", card_scroll_line + 1, card_line_count - 3);
+        } else {
+            snprintf(tag_str, sizeof(tag_str), "CARD");
+        }
+        draw_top_bar(tag_str, card_title[0] ? card_title : "NOTIFICATION", true);
+
+        for (int i = 0; i < 4; i++) {
+            int line_idx = card_scroll_line + i;
+            if (line_idx < card_line_count) {
+                fb_draw_string(2, 14 + i * 11, s_card_lines[line_idx], true, 1);
+            }
+        }
+
+        if (card_line_count > 4) {
+            int bar_h = 42;
+            int bar_y = 14;
+            int thumb_h = (4 * bar_h) / card_line_count;
+            if (thumb_h < 4) thumb_h = 4;
+            int max_scroll = card_line_count - 4;
+            int thumb_y = bar_y + (card_scroll_line * (bar_h - thumb_h)) / (max_scroll > 0 ? max_scroll : 1);
+            fb_draw_vline(127, bar_y, bar_h, true);
+            fb_fill_rect(126, thumb_y, 2, thumb_h, true);
+        }
+
+        if (show_action) {
+            fb_fill_rect(0, 48, OLED_WIDTH, 16, false);
+            fb_draw_rect(0, 48, OLED_WIDTH, 16, true);
+            fb_draw_string_centered(52, action_badge, true, 1);
+        }
+        return;
+    }
+
+    if (pomo_active) {
+        int64_t now = esp_timer_get_time();
+        int elapsed_sec = 0;
+        if (pomo_paused) {
+            elapsed_sec = (int)((pomo_paused_at_us - pomo_start_us) / 1000000);
+        } else {
+            elapsed_sec = (int)((now - pomo_start_us) / 1000000);
+        }
+        int remaining_sec = pomo_duration - elapsed_sec;
+        if (remaining_sec <= 0) {
+            remaining_sec = 0;
+            draw_top_bar("FOCUS", "DONE!", (frame / 5) % 2);
+            fb_draw_string_centered(18, "00:00", true, 2);
+            fb_draw_string_centered(38, "GREAT JOB!", true, 1);
+            fb_draw_string_centered(52, "Tap Key 1 to exit", true, 1);
+        } else {
+            int mins = remaining_sec / 60;
+            int secs = remaining_sec % 60;
+            char time_str[16];
+            snprintf(time_str, sizeof(time_str), "%02d:%02d", mins, secs);
+
+            draw_top_bar("FOCUS", pomo_paused ? "PAUSED" : "RUNNING", !pomo_paused);
+            fb_draw_string_centered(16, time_str, true, 2);
+            fb_draw_string_centered(36, pomo_paused ? "[ PAUSED ]" : "25m Focus Session", true, 1);
+
+            int bx = 16, by = 49, bw = 96, bh = 8;
+            fb_draw_rect(bx, by, bw, bh, true);
+            int filled = (elapsed_sec * (bw - 4)) / pomo_duration;
+            if (filled > (bw - 4)) filled = bw - 4;
+            if (filled > 0) fb_fill_rect(bx + 2, by + 2, filled, bh - 4, true);
+        }
+
+        if (show_action) {
+            fb_fill_rect(0, 48, OLED_WIDTH, 16, false);
+            fb_draw_rect(0, 48, OLED_WIDTH, 16, true);
+            fb_draw_string_centered(52, action_badge, true, 1);
+        }
+        return;
+    }
+
     switch (state) {
         case LED_STATE_BOOT:
             draw_top_bar("BOOT", "STARTING", true);
@@ -429,8 +584,8 @@ static void render_screen_frame(int frame) {
         case LED_STATE_VM_OK:
         case LED_STATE_WS_CONNECTED:
             draw_top_bar("ONLINE", title_buf, true);
-            draw_avatar(64, 32, frame, false, true);
-            fb_draw_string_centered(54, "Hold BOOT to Talk", true, 1);
+            draw_avatar(64, 30, frame, false, true);
+            fb_draw_string_centered(53, "K1:Briefing | 2x:Focus", true, 1);
             break;
 
         case LED_STATE_WS_DISCONNECTED:
@@ -451,6 +606,12 @@ static void render_screen_frame(int frame) {
             fb_draw_string_centered(22, "! ERROR !", true, 2);
             fb_draw_string_centered(46, "Check connection", true, 1);
             break;
+    }
+
+    if (show_action) {
+        fb_fill_rect(0, 48, OLED_WIDTH, 16, false);
+        fb_draw_rect(0, 48, OLED_WIDTH, 16, true);
+        fb_draw_string_centered(52, action_badge, true, 1);
     }
 }
 
@@ -639,5 +800,84 @@ void led_status_show_animation(void) {
     if (!s_mutex) return;
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     s_image_mode = false;
+    s_card_active = false;
+    s_pomodoro_active = false;
+    xSemaphoreGive(s_mutex);
+}
+
+// Smart Action Trigger & Card Reader APIs
+void led_status_show_card(const char *title, const char *text) {
+    if (!s_mutex) return;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    if (title) {
+        strncpy(s_card_title, title, sizeof(s_card_title) - 1);
+        s_card_title[sizeof(s_card_title) - 1] = '\0';
+    } else {
+        s_card_title[0] = '\0';
+    }
+    split_text_into_lines(text);
+    s_card_active = true;
+    s_pomodoro_active = false;
+    xSemaphoreGive(s_mutex);
+}
+
+void led_status_card_scroll(int delta) {
+    if (!s_mutex) return;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    if (s_card_active) {
+        s_card_scroll_line += delta;
+        int max_scroll = s_card_line_count > 4 ? (s_card_line_count - 4) : 0;
+        if (s_card_scroll_line < 0) s_card_scroll_line = 0;
+        if (s_card_scroll_line > max_scroll) s_card_scroll_line = max_scroll;
+    }
+    xSemaphoreGive(s_mutex);
+}
+
+void led_status_trigger_action(int action_id, const char *name) {
+    if (!s_mutex) return;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    if (name) {
+        snprintf(s_action_badge, sizeof(s_action_badge), "ACT %d: %s", action_id, name);
+    } else {
+        snprintf(s_action_badge, sizeof(s_action_badge), "ACT %d", action_id);
+    }
+    s_action_until_us = esp_timer_get_time() + 2500000; // 2.5 seconds
+    xSemaphoreGive(s_mutex);
+}
+
+void led_status_toggle_pomodoro(void) {
+    if (!s_mutex) return;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    if (!s_pomodoro_active) {
+        s_pomodoro_active = true;
+        s_pomodoro_paused = false;
+        s_pomodoro_start_us = esp_timer_get_time();
+        s_pomodoro_duration_sec = POMODORO_DEFAULT_DURATION_SEC;
+        s_card_active = false;
+    } else if (!s_pomodoro_paused) {
+        s_pomodoro_paused = true;
+        s_pomodoro_paused_at_us = esp_timer_get_time();
+    } else {
+        int64_t now = esp_timer_get_time();
+        int64_t paused_duration = now - s_pomodoro_paused_at_us;
+        s_pomodoro_start_us += paused_duration;
+        s_pomodoro_paused = false;
+    }
+    xSemaphoreGive(s_mutex);
+}
+
+bool led_status_is_card_active(void) {
+    if (!s_mutex) return false;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    bool active = s_card_active || s_pomodoro_active;
+    xSemaphoreGive(s_mutex);
+    return active;
+}
+
+void led_status_dismiss_card(void) {
+    if (!s_mutex) return;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    s_card_active = false;
+    s_pomodoro_active = false;
     xSemaphoreGive(s_mutex);
 }
