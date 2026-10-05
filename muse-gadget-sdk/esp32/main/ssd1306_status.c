@@ -30,9 +30,6 @@
 #include "esp_timer.h"
 #include "driver/gpio.h"
 #include "driver/i2c_master.h"
-#include "esp_lcd_panel_io.h"
-#include "esp_lcd_panel_ops.h"
-#include "esp_lcd_panel_vendor.h"
 
 static const char *TAG = "link.ssd1306";
 
@@ -41,8 +38,8 @@ static const char *TAG = "link.ssd1306";
 #define OLED_FB_SIZE (OLED_WIDTH * OLED_HEIGHT / 8)
 
 static i2c_master_bus_handle_t s_i2c_bus = NULL;
-static esp_lcd_panel_io_handle_t s_panel_io = NULL;
-static esp_lcd_panel_handle_t s_panel = NULL;
+static i2c_master_dev_handle_t s_i2c_dev = NULL;
+static uint16_t s_dev_addr = 0x3C;
 
 static SemaphoreHandle_t s_mutex = NULL;
 static led_state_t s_state = LED_STATE_BOOT;
@@ -55,6 +52,74 @@ static int s_volume = 0;
 static int64_t s_volume_until = 0;
 
 static uint8_t s_fb[OLED_FB_SIZE];
+
+// ---- Direct SSD1306 I2C Driver ---------------------------------------------
+
+static esp_err_t ssd1306_send_cmd(uint8_t cmd) {
+    if (!s_i2c_dev) return ESP_ERR_INVALID_STATE;
+    uint8_t buf[2] = {0x00, cmd}; // Co=0, D/C#=0 (Command)
+    return i2c_master_transmit(s_i2c_dev, buf, sizeof(buf), 100);
+}
+
+static esp_err_t ssd1306_send_cmds(const uint8_t *cmds, size_t len) {
+    if (!s_i2c_dev || !cmds || len == 0) return ESP_ERR_INVALID_STATE;
+    uint8_t buf[64];
+    buf[0] = 0x00;
+    if (len > sizeof(buf) - 1) len = sizeof(buf) - 1;
+    memcpy(&buf[1], cmds, len);
+    return i2c_master_transmit(s_i2c_dev, buf, len + 1, 100);
+}
+
+static esp_err_t ssd1306_hw_init(void) {
+    static const uint8_t init_seq1[] = {
+        0xAE,        // Display OFF
+        0xD5, 0x80,  // Set Display Clock Divide Ratio
+        0xA8, 0x3F,  // Set Multiplex Ratio (64 lines: 0x3F)
+        0xD3, 0x00,  // Set Display Offset = 0
+        0x40,        // Set Display Start Line = 0
+        0x8D, 0x14,  // Enable Charge Pump (0x14)
+        0x20, 0x00,  // Memory Addressing Mode: Horizontal
+        0xA1,        // Segment Re-map: column 127 is mapped to SEG0 (mirror X)
+        0xC8,        // COM Output Scan Direction: remapped mode (mirror Y)
+        0xDA, 0x12,  // Set COM Pins Hardware Configuration
+        0x81, 0xCF,  // Set Contrast Control
+        0xD9, 0xF1,  // Set Pre-charge Period
+        0xDB, 0x40,  // Set VCOMH Deselect Level
+        0xA4,        // Entire Display ON (Resume to RAM content)
+        0xA6,        // Set Normal Display (0xA6: Normal, 0xA7: Inverted)
+        0xAF         // Display ON
+    };
+
+    esp_err_t err = ssd1306_send_cmds(init_seq1, sizeof(init_seq1));
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "SSD1306 init commands failed: %s", esp_err_to_name(err));
+        return err;
+    }
+    ESP_LOGI(TAG, "SSD1306 hardware initialized successfully");
+    return ESP_OK;
+}
+
+static esp_err_t ssd1306_flush(const uint8_t *fb) {
+    if (!s_i2c_dev) return ESP_ERR_INVALID_STATE;
+
+    // Set Column (0..127) and Page (0..7) Address Bounds
+    uint8_t pos_cmds[] = {
+        0x21, 0, 127,
+        0x22, 0, 7
+    };
+    esp_err_t err = ssd1306_send_cmds(pos_cmds, sizeof(pos_cmds));
+    if (err != ESP_OK) return err;
+
+    // Send 8 pages of 128 bytes each
+    uint8_t chunk[129];
+    chunk[0] = 0x40; // Co=0, D/C#=1 (Data)
+    for (int page = 0; page < 8; page++) {
+        memcpy(&chunk[1], &fb[page * 128], 128);
+        err = i2c_master_transmit(s_i2c_dev, chunk, sizeof(chunk), 100);
+        if (err != ESP_OK) return err;
+    }
+    return ESP_OK;
+}
 
 // ---- Basic Drawing Primitives ----------------------------------------------
 
@@ -152,7 +217,7 @@ static void fb_fill_circle(int x0, int y0, int r, bool color) {
     }
 }
 
-// ---- UI Components ---------------------------------------------------------
+// ---- UI Layout & Rendering -------------------------------------------------
 
 static void draw_top_bar(const char *state_tag, const char *title, bool dot_on) {
     fb_draw_hline(0, 11, OLED_WIDTH, true);
@@ -238,8 +303,6 @@ static void draw_vu_meter(int y, float level, int frame) {
         fb_draw_vline(x, mid_y - h, h * 2 + 1, true);
     }
 }
-
-// ---- Render Frame ----------------------------------------------------------
 
 static void render_screen_frame(int frame) {
     if (s_image_mode) {
@@ -400,14 +463,12 @@ static void ssd1306_task(void *arg) {
 
     while (1) {
         render_screen_frame(frame++);
-        if (s_panel) {
-            esp_err_t err = esp_lcd_panel_draw_bitmap(s_panel, 0, 0, OLED_WIDTH, OLED_HEIGHT, s_fb);
-            if (err != ESP_OK) {
-                int64_t now = esp_timer_get_time();
-                if (now - last_err_time > 5000000) {
-                    ESP_LOGW(TAG, "SSD1306 refresh err: %s", esp_err_to_name(err));
-                    last_err_time = now;
-                }
+        esp_err_t err = ssd1306_flush(s_fb);
+        if (err != ESP_OK) {
+            int64_t now = esp_timer_get_time();
+            if (now - last_err_time > 5000000) {
+                ESP_LOGW(TAG, "SSD1306 refresh err: %s (addr=0x%02X)", esp_err_to_name(err), s_dev_addr);
+                last_err_time = now;
             }
         }
         vTaskDelay(pdMS_TO_TICKS(50)); // 20 FPS refresh
@@ -452,62 +513,37 @@ bool led_status_init(void) {
         return false;
     }
 
-    uint16_t dev_addr = 0x3C;
+    s_dev_addr = 0x3C;
     if (i2c_master_probe(s_i2c_bus, 0x3C, 100) == ESP_OK) {
-        dev_addr = 0x3C;
+        s_dev_addr = 0x3C;
         ESP_LOGI(TAG, "Found SSD1306 at I2C address 0x3C");
     } else if (i2c_master_probe(s_i2c_bus, 0x3D, 100) == ESP_OK) {
-        dev_addr = 0x3D;
+        s_dev_addr = 0x3D;
         ESP_LOGI(TAG, "Found SSD1306 at I2C address 0x3D");
     } else {
-        ESP_LOGW(TAG, "I2C probe returned no ACK at 0x3C/0x3D, trying 0x3C at 100kHz...");
-        dev_addr = 0x3C;
+        ESP_LOGW(TAG, "I2C probe returned no ACK at 0x3C/0x3D, defaulting to 0x3C");
+        s_dev_addr = 0x3C;
     }
 
-    esp_lcd_panel_io_i2c_config_t io_config = {
-        .dev_addr = dev_addr,
-        .scl_speed_hz = 100 * 1000,
-        .control_phase_bytes = 1,
-        .dc_bit_offset = 6,
-        .lcd_cmd_bits = 8,
-        .lcd_param_bits = 8,
-        .flags = {
-            .dc_low_on_data = 0,
-            .disable_control_phase = 0,
-        },
+    i2c_device_config_t dev_cfg = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address = s_dev_addr,
+        .scl_speed_hz = 400000,
     };
-    err = esp_lcd_new_panel_io_i2c(s_i2c_bus, &io_config, &s_panel_io);
+    err = i2c_master_bus_add_device(s_i2c_bus, &dev_cfg, &s_i2c_dev);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "esp_lcd_new_panel_io_i2c failed: %s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "i2c_master_bus_add_device failed: %s", esp_err_to_name(err));
         return false;
     }
 
-    esp_lcd_panel_dev_config_t panel_cfg = {
-        .reset_gpio_num = -1,
-        .bits_per_pixel = 1,
-    };
-    esp_lcd_panel_ssd1306_config_t ssd1306_cfg = {
-        .height = OLED_HEIGHT,
-    };
-    panel_cfg.vendor_config = &ssd1306_cfg;
-
-    err = esp_lcd_new_panel_ssd1306(s_panel_io, &panel_cfg, &s_panel);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "esp_lcd_new_panel_ssd1306 failed: %s", esp_err_to_name(err));
-        return false;
-    }
-
-    esp_lcd_panel_reset(s_panel);
-    esp_lcd_panel_init(s_panel);
-    esp_lcd_panel_mirror(s_panel, true, true);
-    esp_lcd_panel_disp_on_off(s_panel, true);
-
+    // Initialize hardware and clear screen
+    ssd1306_hw_init();
     fb_clear();
     fb_draw_string_centered(26, "MUSE CHARM", true, 2);
-    esp_lcd_panel_draw_bitmap(s_panel, 0, 0, OLED_WIDTH, OLED_HEIGHT, s_fb);
+    ssd1306_flush(s_fb);
 
     xTaskCreate(ssd1306_task, "ssd1306_task", 3072, NULL, 2, NULL);
-    ESP_LOGI(TAG, "SSD1306 OLED status ready: 128x64 I2C (addr=0x%02X)", dev_addr);
+    ESP_LOGI(TAG, "SSD1306 OLED ready: 128x64 direct I2C");
     return true;
 }
 
@@ -581,9 +617,7 @@ bool led_status_draw_rect(int x, int y, int w, int h, const uint16_t *pixels) {
 }
 
 void led_status_draw_done(void) {
-    if (s_panel) {
-        esp_lcd_panel_draw_bitmap(s_panel, 0, 0, OLED_WIDTH, OLED_HEIGHT, s_fb);
-    }
+    ssd1306_flush(s_fb);
 }
 
 void led_status_show_animation(void) {
