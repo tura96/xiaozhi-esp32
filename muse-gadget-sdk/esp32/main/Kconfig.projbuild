@@ -243,6 +243,7 @@ menu "ESP32 Device SDK"
 
     config HOMEHUB_VOICE
         bool "Push-to-talk voice chat"
+        depends on SPIRAM
         default y
         help
             Hold the button, speak, release: the audio goes to the
